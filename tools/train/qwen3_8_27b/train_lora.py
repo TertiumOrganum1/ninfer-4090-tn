@@ -66,6 +66,7 @@ from unsloth import FastModel  # isort:skip
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,6 +240,31 @@ def parameters_at_rank(parameters: int, rank: int) -> int:
     return parameters * rank // _REFERENCE_RANK
 
 
+def is_supervised_conversation(messages: list[dict]) -> bool:
+    """Return whether messages form a canonical prompt ending in an assistant completion."""
+
+    if not isinstance(messages, list) or len(messages) < 2:
+        return False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            return False
+        role = message.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            return False
+        if role == "system" and index != 0:
+            return False
+    return (messages[-1]["role"] == "assistant"
+            and any(message["role"] == "user" for message in messages[:-1]))
+
+
+def extract_message_completion(messages: list[dict]) -> tuple[list[dict], str]:
+    """Split a canonical full conversation into its prompt and assistant completion."""
+
+    if not is_supervised_conversation(messages):
+        raise ValueError("full-conversation rows require a user prompt and final assistant string")
+    return messages[:-1], messages[-1]["content"]
+
+
 def frozen_base_quantization(model) -> dict:
     """Describe the quantization of the frozen base the adapter was fitted against.
 
@@ -264,21 +290,34 @@ def frozen_base_quantization(model) -> dict:
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--base", required=True, type=Path, help="BF16 checkpoint directory")
     parser.add_argument("--out", required=True, type=Path, help="adapter output directory")
     parser.add_argument("--dataset", default="", help="HF dataset id, or 'json' with --data-files; "
-                        "empty uses --steps 0")
+                        "empty is valid only when no training is requested")
     parser.add_argument("--data-files", default="", help="local file for --dataset json")
-    parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--dataset-field", default="text")
+    parser.add_argument("--dataset-split", default="train",
+                        help="dataset split used for training")
+    parser.add_argument("--dataset-field", default="text",
+                        help="plain-text field for continued pretraining or rendered full loss")
     parser.add_argument("--prompt-column", default="", help="with --response-column, render a "
                         "two-turn chat into --dataset-field using the model chat template")
-    parser.add_argument("--response-column", default="")
+    parser.add_argument("--response-column", default="",
+                        help="assistant response paired with --prompt-column")
     parser.add_argument("--messages-column", default="", help="render a message list column into "
                         "the TRL prompt/completion schema with --completion-column; keeps "
                         "multi-turn history and always takes the loss on the completion only")
-    parser.add_argument("--completion-column", default="completion")
+    parser.add_argument("--completion-column", default="completion",
+                        help="completion field paired with --messages-column")
+    parser.add_argument(
+        "--messages-include-completion",
+        action="store_true",
+        help="take a canonical final assistant message as the completion instead of reading "
+             "--completion-column; structurally invalid conversations are skipped",
+    )
     parser.add_argument("--completion-only", action="store_true",
                         help="mask the prompt and take the loss on the response only")
     # The rendered prompt must match the surface the engine serves. With thinking enabled the
@@ -298,14 +337,38 @@ def parse_arguments() -> argparse.Namespace:
              "training-side experiment only. See MODULE_NOTES for what each one costs and is "
              f"expected to buy. One or more of: {', '.join(sorted(OPTIONAL_MODULES))}",
     )
-    parser.add_argument("--rank", type=int, default=16, choices=(8, 16, 32, 64))
-    parser.add_argument("--alpha", type=int, default=32)
-    parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--steps", type=int, default=0, help="0 writes the initialized adapter")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--accumulate", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--rank", type=int, default=16, choices=(8, 16, 32, 64),
+                        help="LoRA rank; all adapters in one runtime bank must use the same rank")
+    parser.add_argument("--alpha", type=int, default=32,
+                        help="LoRA alpha before conversion folds alpha/rank into B")
+    parser.add_argument("--max-seq-length", type=int, default=1024,
+                        help="maximum rendered sequence length and primary VRAM control")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="optimizer steps; 0 writes an initialized identity adapter")
+    parser.add_argument("--epochs", type=float, default=0.0,
+                        help="training epochs instead of --steps; 0 disables epoch-based training")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="per-device microbatch size")
+    parser.add_argument("--accumulate", type=int, default=8,
+                        help="gradient accumulation steps per optimizer update")
+    parser.add_argument("--learning-rate", type=float, default=2e-4,
+                        help="peak optimizer learning rate")
+    parser.add_argument("--lr-scheduler", default="linear", choices=("linear", "cosine"),
+                        help="learning-rate decay schedule")
+    parser.add_argument("--warmup-ratio", type=float, default=0.0,
+                        help="fraction of optimizer steps used for warmup; 0 uses up to 10 steps")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="AdamW weight decay applied to trainable parameters")
+    parser.add_argument("--neftune-alpha", type=float, default=0.0,
+                        help="NEFTune embedding-noise alpha; 0 disables it")
+    parser.add_argument("--save-steps", type=int, default=500,
+                        help="optimizer-step interval between trainer checkpoints")
+    parser.add_argument("--save-total-limit", type=int, default=2,
+                        help="maximum recent trainer checkpoints retained")
+    parser.add_argument("--resume-from-checkpoint", default="",
+                        help="trainer checkpoint directory to resume, or empty for a fresh run")
+    parser.add_argument("--seed", type=int, default=3407,
+                        help="PEFT initialization, dataset shuffle, and trainer seed")
     return parser.parse_args()
 
 
@@ -313,6 +376,10 @@ def main() -> int:
     arguments = parse_arguments()
     if not arguments.base.is_dir():
         raise SystemExit(f"base checkpoint directory does not exist: {arguments.base}")
+    if arguments.messages_include_completion and not arguments.messages_column:
+        raise SystemExit("--messages-include-completion requires --messages-column")
+    if arguments.steps > 0 and arguments.epochs > 0:
+        raise SystemExit("choose either --steps or --epochs, not both")
 
     extra_modules = sorted(set(arguments.extra_modules))
     targets = list(TARGET_MODULES) + extra_modules
@@ -352,9 +419,10 @@ def main() -> int:
         random_state=arguments.seed,
     )
 
-    if arguments.steps > 0:
+    training_requested = arguments.steps > 0 or arguments.epochs > 0
+    if training_requested:
         if not arguments.dataset:
-            raise SystemExit("--steps > 0 requires --dataset")
+            raise SystemExit("training requires --dataset")
         from datasets import load_dataset
         from trl import SFTConfig, SFTTrainer
 
@@ -374,10 +442,39 @@ def main() -> int:
             # the multimodal processor's `apply_chat_template`, which expects typed content parts
             # and fails on plain text. Rendering here also keeps one owner for the
             # training-surface-equals-serving-surface guarantee.
+            if arguments.messages_include_completion:
+                from jinja2 import TemplateError
+
+                def is_renderable(row: dict) -> bool:
+                    messages = row[arguments.messages_column]
+                    if not is_supervised_conversation(messages):
+                        return False
+                    try:
+                        tokenizer.apply_chat_template(
+                            messages[:-1], tokenize=False, add_generation_prompt=True,
+                            enable_thinking=arguments.thinking)
+                    except TemplateError:
+                        return False
+                    return True
+
+                rows_before = len(dataset)
+                dataset = dataset.filter(
+                    is_renderable,
+                    desc="Filter renderable supervised conversations",
+                )
+                rows_removed = rows_before - len(dataset)
+                if rows_removed:
+                    print(f"skipped {rows_removed:,} non-renderable conversation rows")
+
             def split_messages(batch: dict) -> dict:
                 prompts, completions = [], []
-                for messages, completion in zip(batch[arguments.messages_column],
-                                                batch[arguments.completion_column]):
+                if arguments.messages_include_completion:
+                    rows = (extract_message_completion(messages)
+                            for messages in batch[arguments.messages_column])
+                else:
+                    rows = zip(batch[arguments.messages_column],
+                               batch[arguments.completion_column])
+                for messages, completion in rows:
                     prompts.append(tokenizer.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True,
                         enable_thinking=arguments.thinking))
@@ -425,6 +522,17 @@ def main() -> int:
                     return {arguments.dataset_field: rendered}
 
                 dataset = dataset.map(render, batched=True, remove_columns=dataset.column_names)
+        if arguments.warmup_ratio > 0:
+            if arguments.steps > 0:
+                scheduled_steps = arguments.steps
+            else:
+                microbatches = math.ceil(len(dataset) / arguments.batch_size)
+                updates_per_epoch = math.ceil(microbatches / arguments.accumulate)
+                scheduled_steps = math.ceil(updates_per_epoch * arguments.epochs)
+            warmup_steps = math.ceil(scheduled_steps * arguments.warmup_ratio)
+        else:
+            warmup_steps = min(10, max(1, arguments.steps // 10))
+
         trainer = SFTTrainer(
             model=model,
             train_dataset=dataset,
@@ -433,18 +541,23 @@ def main() -> int:
                 max_length=arguments.max_seq_length,
                 per_device_train_batch_size=arguments.batch_size,
                 gradient_accumulation_steps=arguments.accumulate,
-                max_steps=arguments.steps,
+                max_steps=arguments.steps if arguments.steps > 0 else -1,
+                num_train_epochs=arguments.epochs if arguments.epochs > 0 else 1.0,
                 learning_rate=arguments.learning_rate,
                 optim="adamw_8bit",
-                lr_scheduler_type="linear",
-                warmup_steps=min(10, max(1, arguments.steps // 10)),
+                lr_scheduler_type=arguments.lr_scheduler,
+                warmup_steps=warmup_steps,
+                weight_decay=arguments.weight_decay,
+                neftune_noise_alpha=arguments.neftune_alpha or None,
+                save_steps=arguments.save_steps,
+                save_total_limit=arguments.save_total_limit,
                 logging_steps=1,
                 seed=arguments.seed,
                 output_dir=str(arguments.out / "trainer"),
                 report_to="none",
             ),
         )
-        trainer.train()
+        trainer.train(resume_from_checkpoint=arguments.resume_from_checkpoint or None)
 
     arguments.out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(arguments.out))
@@ -457,12 +570,24 @@ def main() -> int:
         "target_modules": targets,
         "extra_modules": extra_modules,
         "steps": arguments.steps,
+        "epochs": arguments.epochs,
         "max_seq_length": arguments.max_seq_length,
+        "learning_rate": arguments.learning_rate,
+        "lr_scheduler": arguments.lr_scheduler,
+        "warmup_ratio": arguments.warmup_ratio,
+        "warmup_steps": warmup_steps if training_requested else 0,
+        "weight_decay": arguments.weight_decay,
+        "neftune_alpha": arguments.neftune_alpha,
+        "batch_size": arguments.batch_size,
+        "accumulate": arguments.accumulate,
+        "save_steps": arguments.save_steps,
+        "save_total_limit": arguments.save_total_limit,
         "seed": arguments.seed,
         "dataset": arguments.dataset,
         "data_files": arguments.data_files,
         "dataset_split": arguments.dataset_split,
         "messages_column": arguments.messages_column,
+        "messages_include_completion": arguments.messages_include_completion,
         # The messages schema is prompt/completion by construction, so its loss is completion-only
         # whether or not the flag was passed.
         "completion_only_loss": bool(arguments.completion_only or arguments.messages_column),
