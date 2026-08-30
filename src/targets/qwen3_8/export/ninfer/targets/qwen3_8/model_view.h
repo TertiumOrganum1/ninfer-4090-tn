@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace ninfer {
 
@@ -58,12 +59,13 @@ struct OptimizedProposalWeights {
     Tensor token_ids;
 };
 
-// One registered low-rank correction site, banked over every registered adapter.
+// One registered low-rank correction site, banked over every resident slot.
 //
-// `a` holds the registered adapters' [rank, K] factors back to back and `b` their [N, rank]
-// factors, so a bank index selects a plane by a fixed byte stride. The alpha/r scale is folded
-// into `b` at conversion, so no runtime scale exists. A site whose `a` is null was not trained
-// by any registered adapter and is never scheduled.
+// `a` holds the resident slots' [rank, K] factors back to back and `b` their [N, rank] factors,
+// so a slot index selects a plane by a fixed byte stride. The alpha/r scale is folded into `b`
+// at conversion, so no runtime scale exists. A site whose `a` is null is outside the bank
+// profile - no pool adapter trained it - and is never scheduled. A site inside the profile that
+// the slot's current occupant did not train holds zeros, which contribute nothing.
 struct LoraSiteWeights {
     Tensor a;
     Tensor b;
@@ -79,7 +81,7 @@ struct LoraApplication {
     const LoraSiteWeights* site   = nullptr;
     const Tensor* adapter_index   = nullptr;
     std::int32_t rank             = 0;
-    std::int32_t adapter_count    = 0;
+    std::int32_t slot_count       = 0;
 
     [[nodiscard]] bool active() const noexcept {
         return site != nullptr && site->present() && adapter_index != nullptr;
@@ -102,13 +104,27 @@ struct LoraGdnLayerWeights {
     LoraSiteWeights down;
 };
 
-// A startup-fixed bank of resident adapters. Every registered adapter shares one rank, so the
-// rank and the per-site strides are kernel constants and the bank is one persistent allocation
-// with deterministic offsets.
-template <std::size_t FullAttentionLayers, std::size_t GdnLayers>
+// A startup-fixed bank of resident slots drawn from an unbounded adapter pool. The rank, the
+// site geometry and the per-site slot stride are frozen here and enter the captured graph as
+// constants; which slot a row selects is a device-resident value the graph re-reads on every
+// replay. Restaging a slot therefore changes only its bytes, never the capture.
+template <class LoraPoolPayload, std::size_t FullAttentionLayers, std::size_t GdnLayers>
 struct LoraWeights {
-    std::uint32_t adapters = 0;
-    std::int32_t rank      = 0;
+    // Device-resident slots, and the pool they are drawn from. A request names a pool adapter;
+    // the engine owns which slot currently holds it.
+    std::uint32_t slots     = 0;
+    std::uint32_t pool_size = 0;
+    std::int32_t rank       = 0;
+    // The package-owned pool and staging mechanism the family's residency policy drives through
+    // the Variant's prepare/commit entry points. The family never interprets it. Held by pointer so a
+    // `const ModelView&` still reaches a mutable bank: which adapter occupies a slot changes
+    // while the model itself does not.
+    LoraPoolPayload* pool = nullptr;
+    // Content fingerprint of every pool adapter, in pool order. This is an adapter's identity in
+    // every persisted or cached form. A pool position is a load-order detail and a slot is a
+    // residency detail; neither survives a restart or a swap, so neither may key state that
+    // outlives the request that produced it.
+    std::vector<std::array<std::uint8_t, 32>> fingerprints;
     // Device bytes the package committed for the whole bank. The bank is its own arena outside
     // the weights arena, so this is the only route by which the family's memory summary can
     // account for it instead of leaving it as unexplained missing free memory.
@@ -140,13 +156,13 @@ struct DFlashWeights {
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
-          std::size_t FullAttentionLayers, std::size_t GdnLayers>
+          class LoraPoolPayload, std::size_t FullAttentionLayers, std::size_t GdnLayers>
 struct ModelView {
     using FullLayer = FullAttentionWeights<FullProjectionPayload, MainPostMixerPayload>;
     using GdnLayer  = GdnWeights<GdnProjectionPayload, MainPostMixerPayload>;
     using MtpLayer  = MtpWeights<MtpAttentionPayload, MtpPostMixerPayload>;
     using DFlash    = DFlashPayload;
-    using Lora      = LoraWeights<FullAttentionLayers, GdnLayers>;
+    using Lora      = LoraWeights<LoraPoolPayload, FullAttentionLayers, GdnLayers>;
 
     DeviceArena* weights_arena = nullptr;
     Weight token_embedding;

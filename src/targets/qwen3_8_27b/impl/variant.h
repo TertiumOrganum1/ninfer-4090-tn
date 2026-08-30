@@ -89,6 +89,10 @@ struct Variant {
                                 Tensor& residual, const qwen3_8::LoraApplication& lora,
                                 qwen3_8::TextPhase phase, WorkspaceArena& workspace,
                                 cudaStream_t stream);
+    // Prepare validates and assembles the adapter without touching residency; commit performs the
+    // one upload after the family has released the victim slot's soft-retained lanes.
+    static void lora_prepare_slot(const ModelView& model, std::size_t index);
+    static void lora_commit_slot(const ModelView& model, std::uint32_t slot, DeviceContext& device);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t

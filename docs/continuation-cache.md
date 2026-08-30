@@ -134,16 +134,26 @@ Responses pass the string to the Engine as a session alias. On every candidate, 
   deepest planner-usable frontier: either the saved execution frontier or its rolling turn
   checkpoint;
 - the complete required segment inventory and encoded layouts;
-- the selected LoRA adapter, when the process was started with `--lora`.
+- the selected LoRA adapter, when the process was started with `--lora-dir`.
 
 Adapter scoping is not one check but three, because KV and GDN state produced under one adapter is
 numerically invalid under another. Every session alias and stable-prefix alias is namespaced by the
 selected adapter, unconditionally — base weights get a scope too, so no unscoped key exists and two
 adapters cannot collide on one string. A resident lane records the adapter that produced it and
-refuses in-place prefix reuse across a mismatch. And a saved slot image carries both the registered
-adapter *set*, folded into the slot binding digest, and the *index* that produced it, in the
-session record. Reusing one `prompt_cache_key` across adapters is therefore a safe miss rather than
-a correctness failure, in either direction.
+refuses in-place prefix reuse across a mismatch. And a saved slot image records the SHA-256 content
+fingerprint of the adapter artifact that produced it.
+
+That identity is content, not position. The adapter pool is enumerated from a directory, so a pool
+index means nothing across restarts — adding one file renumbers everything after it. A fingerprint
+survives the directory being extended, pruned or reordered, and an image whose adapter is no longer
+present fails to resolve and is refused rather than replayed against whichever adapter inherited its
+index. Reusing one `prompt_cache_key` across adapters is therefore a safe miss rather than a
+correctness failure, in either direction.
+
+The image's model binding separately carries the complete base artifact SHA-256. Registered
+`model_id` and `weights_id` strings alone do not identify exact weight bytes, while folding the
+whole adapter name list into the binding would unnecessarily invalidate an image when an unrelated
+adapter was added.
 
 The complete image is validated before import. Checkpoint fallback then trims paged state and
 restores saved GDN, hidden, and backend checkpoint state before recomputing the divergent suffix.

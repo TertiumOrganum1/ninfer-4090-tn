@@ -143,6 +143,14 @@ target_include_directories(ninfer_qwen3_8_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export)
 target_link_libraries(ninfer_qwen3_8_27b_load_plan_test PRIVATE CUDA::cudart)
   set_tests_properties(ninfer_qwen3_8_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_lora_pool_test
+  SOURCES targets/qwen3_8_27b/test_lora_pool.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_8_27b_lora_pool_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export)
+target_link_libraries(ninfer_qwen3_8_27b_lora_pool_test PRIVATE CUDA::cudart)
+  set_tests_properties(ninfer_qwen3_8_27b_lora_pool_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 if(NINFER_BUILD_QWEN3_6_35B_A3B)
   ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test

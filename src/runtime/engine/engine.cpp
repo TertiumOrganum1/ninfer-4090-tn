@@ -26,24 +26,25 @@
 namespace ninfer {
 namespace {
 
-// Resolves a requested adapter name against the startup-registered bank. An unregistered name is
-// a request error rather than a silent fall back to the base weights, because the two produce
-// different output and the caller asked for one of them specifically.
-std::int32_t resolve_adapter(const std::vector<std::string>& registered,
+// Resolves a requested adapter name to its pool index. Residency is not consulted: every
+// discovered adapter is selectable, and the engine stages it into a slot at admission. A name
+// outside the pool is a request error rather than a silent fall back to the base weights,
+// because the two produce different output and the caller asked for one of them specifically.
+std::int32_t resolve_adapter(const std::vector<std::string>& pool,
                              const std::optional<std::string>& requested) {
     if (!requested.has_value()) { return -1; }
-    for (std::size_t index = 0; index < registered.size(); ++index) {
-        if (registered[index] == *requested) { return static_cast<std::int32_t>(index); }
+    for (std::size_t index = 0; index < pool.size(); ++index) {
+        if (pool[index] == *requested) { return static_cast<std::int32_t>(index); }
     }
     std::string known;
-    for (const std::string& name : registered) {
+    for (const std::string& name : pool) {
         known += known.empty() ? "" : ", ";
         known += name;
     }
     throw RequestError(RequestErrorKind::UnknownAdapter,
-                       "LoRA adapter '" + *requested + "' is not registered; " +
-                           (registered.empty() ? "this engine registered no adapters"
-                                               : "registered adapters are: " + known));
+                       "LoRA adapter '" + *requested + "' is not in this engine's pool; " +
+                           (pool.empty() ? "this engine discovered no adapters"
+                                         : "available adapters are: " + known));
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -155,10 +156,16 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 namespace {
 
 std::string slot_model_binding(const LoadSummary& load) {
-    // The resident adapter set is part of the binding: a slot image carries KV and GDN state
-    // whose meaning depends on which adapters were registered and in what bank order.
-    std::string binding = load.target + '\n' + load.model_id + '\n' + load.weights_id;
-    for (const std::string& adapter : load.lora_adapter_names) { binding += '\n' + adapter; }
+    // The base fingerprint pins the exact weights that produced the state. Adapter identity is
+    // carried separately in snapshot v4 by its own fingerprint, so changing unrelated pool names
+    // or order must not invalidate an otherwise compatible image.
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string binding = load.target + '\n' + load.model_id + '\n' + load.weights_id + "\nsha256:";
+    binding.reserve(binding.size() + load.artifact_fingerprint.size() * 2U);
+    for (const std::uint8_t byte : load.artifact_fingerprint) {
+        binding.push_back(hex[byte >> 4U]);
+        binding.push_back(hex[byte & 0x0fU]);
+    }
     return binding;
 }
 

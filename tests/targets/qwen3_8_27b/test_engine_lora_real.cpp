@@ -7,6 +7,9 @@
 // prefill chunk produced, so it can only move if prefill ran with the adapter.
 #include "ninfer/engine.h"
 
+#include <unistd.h> // getpid, for a per-process temporary pool directory
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -19,13 +22,45 @@
 
 namespace {
 
-// Every adapter in one bank shares a rank and a site inventory, so the two fixtures must come
-// from the same converter inventory. The trained arm carries a behavioural signature; a synthetic
-// random delta is unstructured noise that does not reliably move a confident argmax, and its
-// numerics are already covered by tests/ops/test_lora_delta_add.cpp.
+// The pool is discovered from a directory and an adapter's name is its file stem. The trained arm
+// carries a behavioural signature; a synthetic random delta is unstructured noise that does not
+// reliably move a confident argmax, and its numerics are already covered by
+// tests/ops/test_lora_delta_add.cpp.
 constexpr const char* kZeroName    = "zero";
 constexpr const char* kTrainedName = "trained";
 constexpr const char* kGdnName     = "gdn-only";
+
+// A temporary adapter directory built from the fixtures the environment names. Discovery orders
+// the pool by file name, so the pool index of a name here is its sorted position.
+class PoolDirectory {
+public:
+    explicit PoolDirectory(const char* label) {
+        root_ = std::filesystem::temp_directory_path() /
+                ("ninfer_lora_pool_" + std::string(label) + "_" + std::to_string(::getpid()));
+        std::error_code error;
+        std::filesystem::remove_all(root_, error);
+        std::filesystem::create_directories(root_);
+    }
+
+    ~PoolDirectory() {
+        std::error_code error;
+        std::filesystem::remove_all(root_, error);
+    }
+
+    PoolDirectory(const PoolDirectory&)            = delete;
+    PoolDirectory& operator=(const PoolDirectory&) = delete;
+
+    PoolDirectory& add(const char* name, const char* path) {
+        std::filesystem::create_symlink(std::filesystem::absolute(path),
+                                        root_ / (std::string(name) + ".lora.ninfer"));
+        return *this;
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return root_; }
+
+private:
+    std::filesystem::path root_;
+};
 
 // A real chat turn, not a synthetic token run. The first assistant token has to be genuinely
 // contested for an argmax comparison to have any sensitivity, and the public API exposes no
@@ -95,10 +130,19 @@ std::vector<ninfer::TokenId> run(ninfer::Engine& engine, std::uint32_t output_to
     return result.generated_token_ids;
 }
 
+// Discovery names an adapter by its file stem and orders the pool by file name.
 int verify_registration(const ninfer::Engine& engine) {
-    const std::vector<std::string>& names = engine.load_summary().lora_adapter_names;
-    if (names.size() != 2 || names[0] != kZeroName || names[1] != kTrainedName) {
-        std::cerr << "registered adapter names are wrong: " << names.size() << " entries\n";
+    const ninfer::LoadSummary& load       = engine.load_summary();
+    const std::vector<std::string>& names = load.lora_adapter_names;
+    if (names.size() != 2 || names[0] != kTrainedName || names[1] != kZeroName) {
+        std::cerr << "discovered adapter names are wrong: " << names.size() << " entries\n";
+        return 1;
+    }
+    // The whole pool is selectable while only `slots` of it is resident; a client never sees the
+    // difference, so the summary has to report both.
+    if (load.lora_slots == 0 || load.lora_slots > names.size()) {
+        std::cerr << "resident slot count " << load.lora_slots << " does not fit a pool of "
+                  << names.size() << '\n';
         return 1;
     }
     return 0;
@@ -347,14 +391,17 @@ int verify_slot_restore_keeps_adapter_identity(ninfer::Engine& engine) {
 // is fitted to it. That single-lane long-context shape is also the product's default.
 int verify_long_prompt_fits_the_workspace(const char* artifact, const char* zero_path,
                                           const char* trained_path) {
+    PoolDirectory pool("workspace");
+    pool.add(kZeroName, zero_path).add(kTrainedName, trained_path);
+
     ninfer::EngineOptions options;
     options.artifact_path   = artifact;
     options.max_context     = 40960;
     options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(40960);
     options.prefill_chunk   = 1024;
     options.max_concurrency = 1;
-    options.lora_adapters   = {ninfer::LoraAdapterSpec{.name = kZeroName, .path = zero_path},
-                               ninfer::LoraAdapterSpec{.name = kTrainedName, .path = trained_path}};
+    options.lora.directory  = pool.path();
+    options.lora.slots      = 2;
     ninfer::Engine engine(options);
     for (const std::uint32_t tokens : {1024U, 8192U, 32768U}) {
         std::vector<ninfer::TokenId> ids(tokens, 198);
@@ -385,24 +432,64 @@ int verify_long_prompt_fits_the_workspace(const char* artifact, const char* zero
 // short, confident prompt, which would make this gate report a defect that is not there. The
 // question here is whether the delta reaches the residual at all, so the amplitude is chosen to
 // answer that question unambiguously rather than to resemble a trained adapter.
-int verify_gdn_site_applies(const char* artifact, const char* gdn_only_path) {
+std::vector<ninfer::TokenId> gdn_only_tokens(const char* artifact, const char* gdn_only_path,
+                                             const char* trained_path, bool* moved) {
+    PoolDirectory pool(trained_path == nullptr ? "gdn_alone" : "gdn_union");
+    pool.add(kGdnName, gdn_only_path);
+    if (trained_path != nullptr) { pool.add(kTrainedName, trained_path); }
+
     ninfer::EngineOptions options;
     options.artifact_path   = artifact;
     options.max_context     = 2048;
     options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk   = 1024;
     options.max_concurrency = 1;
-    options.lora_adapters   = {ninfer::LoraAdapterSpec{.name = kGdnName, .path = gdn_only_path}};
+    options.lora.directory  = pool.path();
+    options.lora.slots      = 1;
 
     ninfer::Engine engine(options);
     const std::vector<ninfer::TokenId> base    = run(engine, 24, std::nullopt);
     const std::vector<ninfer::TokenId> adapted = run(engine, 24, kGdnName);
-    if (base == adapted) {
+    if (moved != nullptr) { *moved = base != adapted; }
+    return adapted;
+}
+
+int verify_gdn_site_applies(const char* artifact, const char* gdn_only_path) {
+    bool moved = false;
+    (void)gdn_only_tokens(artifact, gdn_only_path, nullptr, &moved);
+    if (!moved) {
         std::cerr << "a gdn/output-only adapter left the output unchanged, so the correction on "
                      "the 48 GDN layers never reached the residual\n";
         return 1;
     }
     std::cout << "  gdn/output: the 48-layer correction alone moves the output\n";
+    return 0;
+}
+
+// Union-profile equivalence.
+//
+// The bank profile is the union of every pool adapter's sites, so putting a one-site adapter in a
+// pool with a seven-site one widens the geometry the captured graph executes. The narrow adapter
+// stages zeros into the six sites it never trained, and a zero factor contributes nothing, so its
+// output must be identical to the same adapter loaded on its own. If it is not, the union either
+// left residue from another adapter in the slab or mapped a factor to the wrong offset - both of
+// which are silent, and neither of which any single-adapter check can see.
+int verify_union_profile_preserves_narrow_adapter(const char* artifact, const char* gdn_only_path,
+                                                  const char* trained_path) {
+    const std::vector<ninfer::TokenId> alone =
+        gdn_only_tokens(artifact, gdn_only_path, nullptr, nullptr);
+    const std::vector<ninfer::TokenId> united =
+        gdn_only_tokens(artifact, gdn_only_path, trained_path, nullptr);
+    if (alone.empty() || united.empty()) {
+        std::cerr << "a gdn/output-only request generated nothing\n";
+        return 1;
+    }
+    if (alone != united) {
+        std::cerr << "a one-site adapter produced different output in a union bank than on its "
+                     "own, so the widened profile does not zero-fill the sites it never trained\n";
+        return 1;
+    }
+    std::cout << "  union profile: a one-site adapter is unchanged by a seven-site pool peer\n";
     return 0;
 }
 
@@ -416,11 +503,74 @@ int verify_unknown_adapter_is_rejected(ninfer::Engine& engine) {
         }
         return 0;
     }
-    std::cerr << "an unregistered adapter name was accepted\n";
+    std::cerr << "an adapter name outside the pool was accepted\n";
     return 1;
 }
 
+// Slot swapping is transparent to output.
+//
+// With one slot and two pool adapters, every alternation evicts the resident adapter and stages
+// the other over the same device address. That address is what the captured graph holds, so a
+// swap must be invisible: each adapter has to produce exactly what it produced when it was the
+// only occupant. This is the gate on staging - zeroing, rank padding, and the offsets a factor
+// lands at - because a partial or misaligned stage still yields plausible text.
+int verify_slot_swap_is_transparent(const char* artifact, const char* zero_path,
+                                    const char* trained_path) {
+    PoolDirectory pool("swap");
+    pool.add(kZeroName, zero_path).add(kTrainedName, trained_path);
+
+    constexpr std::uint32_t kTokens = 12;
+    ninfer::EngineOptions options;
+    options.artifact_path   = artifact;
+    options.max_context     = 2048;
+    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk   = 1024;
+    options.max_concurrency = 1;
+    options.lora.directory  = pool.path();
+    options.lora.slots      = 1;
+
+    ninfer::Engine engine(options);
+    // References with no swap in between: each adapter is staged once, into an empty slot.
+    const std::vector<ninfer::TokenId> trained_first = run(engine, kTokens, kTrainedName);
+    const std::vector<ninfer::TokenId> zero_first    = run(engine, kTokens, kZeroName);
+    if (trained_first.size() != kTokens || zero_first.size() != kTokens) {
+        std::cerr << "a swap-arm request did not generate the requested token count\n";
+        return 1;
+    }
+    if (trained_first == zero_first) {
+        std::cerr << "swap check is inert: the two adapters agree on this prompt\n";
+        return 1;
+    }
+
+    // Alternate, forcing an eviction and a restage before every request.
+    for (int round = 0; round < 2; ++round) {
+        if (run(engine, kTokens, kTrainedName) != trained_first) {
+            std::cerr << "the trained adapter produced different output after being swapped back "
+                         "into its slot\n";
+            return 1;
+        }
+        if (run(engine, kTokens, kZeroName) != zero_first) {
+            std::cerr << "the zero adapter produced different output after being swapped back "
+                         "into its slot\n";
+            return 1;
+        }
+    }
+    // A base request in a swapping engine must still be exactly the base: the resident slot holds
+    // whichever adapter ran last, and only the negative per-row index keeps it out.
+    const std::vector<ninfer::TokenId> base_after = run(engine, kTokens, std::nullopt);
+    if (base_after == trained_first) {
+        std::cerr << "a base request returned the resident adapter's output\n";
+        return 1;
+    }
+    std::cout << "  slot swap: both adapters reproduce their unswapped output at one slot after "
+              << engine.load_summary().lora_slots << "-slot alternation\n";
+    return 0;
+}
+
 int exercise(const char* artifact, const char* zero_path, const char* trained_path) {
+    PoolDirectory pool("exercise");
+    pool.add(kZeroName, zero_path).add(kTrainedName, trained_path);
+
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     options.max_context   = 2048;
@@ -430,8 +580,9 @@ int exercise(const char* artifact, const char* zero_path, const char* trained_pa
     // shared KV pool is far from its bound.
     options.max_concurrency = 4;
     options.enable_vision   = true;
-    options.lora_adapters = {ninfer::LoraAdapterSpec{.name = kZeroName, .path = zero_path},
-                             ninfer::LoraAdapterSpec{.name = kTrainedName, .path = trained_path}};
+    // Both adapters resident, so this file's routing checks are not also exercising residency.
+    options.lora.directory = pool.path();
+    options.lora.slots     = 2;
 
     ninfer::Engine engine(options);
     if (const int result = verify_registration(engine); result != 0) { return result; }
@@ -470,11 +621,19 @@ int main() {
         return 77;
     }
     if (const int result = exercise(artifact, zero, trained); result != 0) { return result; }
+    if (const int result = verify_slot_swap_is_transparent(artifact, zero, trained); result != 0) {
+        return result;
+    }
     if (const int result = verify_long_prompt_fits_the_workspace(artifact, zero, trained);
         result != 0) {
         return result;
     }
     if (const int result = verify_gdn_site_applies(artifact, gdn_only); result != 0) {
+        return result;
+    }
+    if (const int result =
+            verify_union_profile_preserves_narrow_adapter(artifact, gdn_only, trained);
+        result != 0) {
         return result;
     }
     std::cout << "ok\n";

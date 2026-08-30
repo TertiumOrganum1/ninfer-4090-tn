@@ -29,6 +29,32 @@ namespace {
 using Clock = std::chrono::steady_clock;
 namespace image = qwen3_8::detail::continuation;
 
+// Routes slot staging to the package through a dependent branch, so a target without a
+// registered site table never names the entry point. Residency is family policy; the bytes,
+// the pool and the bank profile are the package's.
+template <class V>
+void prepare_lora_slot(const LoadedModelData& model, std::size_t index) {
+    if constexpr (V::supports_lora) {
+        V::lora_prepare_slot(model, index);
+    } else {
+        (void)model;
+        (void)index;
+        throw std::logic_error("this target registers no LoRA site table");
+    }
+}
+
+template <class V>
+void commit_lora_slot(const LoadedModelData& model, std::uint32_t slot, DeviceContext& device) {
+    if constexpr (V::supports_lora) {
+        V::lora_commit_slot(model, slot, device);
+    } else {
+        (void)model;
+        (void)slot;
+        (void)device;
+        throw std::logic_error("this target registers no LoRA site table");
+    }
+}
+
 void write_paged_layout(image::Writer& out, const qwen3_8::PagedKVCacheLayout& layout) {
     out.u32(layout.layers);
     out.u32(layout.max_context);
@@ -381,6 +407,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
+    if (model.lora) {
+        // Every slot starts empty and the bank starts zeroed, so a replay before the first stage
+        // reads an exact no-op rather than uninitialized device memory.
+        lora_slot_pool_.assign(static_cast<std::size_t>(model.lora->slots), -1);
+        lora_slot_used_.assign(static_cast<std::size_t>(model.lora->slots), 0);
+    }
 
     if (checkpoint_ring_capacity != 0) {
         if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -446,6 +478,107 @@ ProgramImplCore::~ProgramImplCore() noexcept {
             event = nullptr;
         }
     }
+}
+
+std::int32_t ProgramImplCore::lora_slot(std::int32_t adapter) const {
+    if (adapter < 0) { return -1; }
+    for (std::size_t slot = 0; slot < lora_slot_pool_.size(); ++slot) {
+        if (lora_slot_pool_[slot] == adapter) { return static_cast<std::int32_t>(slot); }
+    }
+    throw std::logic_error("a running sequence selects a LoRA adapter that is not resident");
+}
+
+bool ProgramImplCore::lora_slot_pinned(std::size_t slot) const noexcept {
+    const std::int32_t occupant = lora_slot_pool_[slot];
+    if (occupant < 0) { return false; }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (sequences[lane].adapter != occupant) { continue; }
+        const Lifecycle lifecycle = requests[lane].lifecycle;
+        // A generating lane is executing against this slot's bytes right now. A merely retained
+        // lane is an L1 optimization the caller can spend; it is soft, not pinned.
+        if (lifecycle == Lifecycle::Prefilling || lifecycle == Lifecycle::Active ||
+            lifecycle == Lifecycle::Pending) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ProgramImplCore::ensure_adapter_resident(
+    std::int32_t adapter, const std::function<void(std::uint32_t)>& release_retained) {
+    if (adapter < 0) { return true; }
+    if (lora_slot_pool_.empty() ||
+        adapter >= static_cast<std::int32_t>(model.lora->pool_size)) {
+        throw std::invalid_argument("selected LoRA adapter is outside the pool");
+    }
+    ++lora_clock_;
+    for (std::size_t slot = 0; slot < lora_slot_pool_.size(); ++slot) {
+        if (lora_slot_pool_[slot] == adapter) {
+            lora_slot_used_[slot] = lora_clock_;
+            return true;
+        }
+    }
+
+    // An empty slot first, then the least recently used slot no generating lane depends on. A
+    // pinned slot is never a candidate: its occupant's KV and GDN state would become
+    // uninterpretable the moment the bytes changed.
+    std::size_t victim = lora_slot_pool_.size();
+    for (std::size_t slot = 0; slot < lora_slot_pool_.size(); ++slot) {
+        if (lora_slot_pool_[slot] < 0) {
+            victim = slot;
+            break;
+        }
+        if (lora_slot_pinned(slot)) { continue; }
+        if (victim == lora_slot_pool_.size() || lora_slot_used_[slot] < lora_slot_used_[victim]) {
+            victim = slot;
+        }
+    }
+    if (victim == lora_slot_pool_.size()) { return false; }
+
+    // File open, identity verification and host assembly can fail for ordinary input reasons.
+    // Complete them before demoting retained state; commit below is then only one device upload.
+    prepare_lora_slot<Variant>(model, static_cast<std::size_t>(adapter));
+    const std::int32_t evicted = lora_slot_pool_[victim];
+    if (evicted >= 0) {
+        // Retained lanes holding this adapter go out through the caller, which publishes their
+        // sessions to L2/L3 and keeps its own L1 accounting straight. Doing it here would drop
+        // the state instead of demoting it.
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (sequences[lane].adapter == evicted && sequences[lane].retained) {
+                release_retained(lane);
+            }
+        }
+        // Anything still naming the evicted adapter is an idle lane whose association would
+        // silently hand it the new occupant's weights if it were ever reused.
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (sequences[lane].adapter == evicted) { sequences[lane].adapter = -1; }
+        }
+    }
+    // Committed before the slot is recorded, so a failed upload leaves the slot unavailable rather
+    // than claiming it holds bytes that did not arrive.
+    lora_slot_pool_[victim] = -1;
+    commit_lora_slot<Variant>(model, static_cast<std::uint32_t>(victim), device);
+    lora_slot_pool_[victim] = adapter;
+    lora_slot_used_[victim] = lora_clock_;
+    ++lora_stage_count_;
+    return true;
+}
+
+std::string ProgramImplCore::adapter_scope(std::int32_t adapter) const {
+    if (adapter < 0) { return "base"; }
+    if (!model.lora ||
+        static_cast<std::size_t>(adapter) >= model.lora->fingerprints.size()) {
+        throw std::invalid_argument("selected LoRA adapter is outside the pool");
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    const auto& fingerprint      = model.lora->fingerprints[static_cast<std::size_t>(adapter)];
+    std::string scope;
+    scope.reserve(fingerprint.size() * 2U);
+    for (const std::uint8_t byte : fingerprint) {
+        scope.push_back(kHex[byte >> 4]);
+        scope.push_back(kHex[byte & 0x0FU]);
+    }
+    return scope;
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -1904,6 +2037,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     request.prefill.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
+    // A cleared lane holds no adapter-dependent state, so it must stop pinning the slot it used.
+    sequence.adapter            = -1;
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
@@ -2724,7 +2859,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
             dflash_host_ingress,
-            sequence.adapter};
+            lora_slot(sequence.adapter)};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -2997,7 +3132,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            ordinary_host_ingress->adapters[row] = sequence.adapter;
+            ordinary_host_ingress->adapters[row] = lora_slot(sequence.adapter);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
@@ -3128,7 +3263,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
-            mtp_host_ingress->adapters[row]           = sequence.adapter;
+            mtp_host_ingress->adapters[row]           = lora_slot(sequence.adapter);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1,
@@ -3292,7 +3427,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->adapters[row] = sequence.adapter;
+            dflash_host_ingress->adapters[row] = lora_slot(sequence.adapter);
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }

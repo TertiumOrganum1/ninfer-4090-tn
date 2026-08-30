@@ -220,9 +220,11 @@ struct SequenceState {
     Tensor tail_hidden;
     Tensor turn_checkpoint_hidden;
     std::uint32_t lane = 0;
-    // LoRA bank index that produced this continuation, or -1 for the base weights. KV and GDN
-    // recurrent state are only valid for the adapter that produced them, so this is part of the
-    // sequence identity rather than request state.
+    // Pool index of the adapter that produced this continuation, or -1 for the base weights. KV
+    // and GDN recurrent state are only valid for the adapter that produced them, so this is part
+    // of the sequence identity rather than request state. It is deliberately the pool index and
+    // not the bank slot: a slot is reassigned as adapters are swapped, and comparing slots would
+    // let a lane splice one adapter's state into another's request.
     std::int32_t adapter = -1;
 
     std::uint32_t execution_frontier = 0;
@@ -293,6 +295,26 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
+    // LoRA residency. `SequenceState::adapter` is a pool index - the adapter's identity, stable
+    // for the process - while the device bank holds a bounded number of slots. This resolves one
+    // to the other, staging the adapter over the least recently used slot that no generating
+    // lane depends on. Returns true when the adapter is resident afterwards.
+    //
+    // Retained lanes holding the displaced adapter are released through `release_retained`
+    // rather than dropped here, so the caller publishes their sessions and keeps its own L1
+    // accounting straight.
+    //
+    // Returns false, changing nothing, when every slot is held by a generating lane using
+    // another adapter; the caller defers the request. This cannot deadlock: an idle engine has
+    // no generating lane, so a request reaching the head of an empty engine always fits. The
+    // base weights (-1) are always resident.
+    [[nodiscard]] bool
+    ensure_adapter_resident(std::int32_t adapter,
+                            const std::function<void(std::uint32_t)>& release_retained);
+    // Stable cache scope for a pool adapter: "base", or its artifact content fingerprint as hex.
+    [[nodiscard]] std::string adapter_scope(std::int32_t adapter) const;
+    [[nodiscard]] std::uint64_t lora_stage_count() const noexcept { return lora_stage_count_; }
+
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -353,9 +375,10 @@ public:
     retained_lane_checkpoints(std::uint32_t lane) const;
     [[nodiscard]] qwen3_8::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t lane, std::string_view model_binding);
-    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
-                                                      std::span<const std::uint8_t> snapshot,
-                                                      std::string_view model_binding);
+    [[nodiscard]] std::uint32_t
+    restore_retained_lane(std::uint32_t lane, std::span<const std::uint8_t> snapshot,
+                          std::string_view model_binding,
+                          const std::function<void(std::uint32_t)>& release_retained);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -437,6 +460,24 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    // Translates a pool adapter into the bank slot it occupies. -1 for the base weights, which
+    // the kernels read as "leave this column alone". A live sequence whose adapter is not
+    // resident is a scheduling fault, not a recoverable condition, because admission is the only
+    // place residency is decided.
+    [[nodiscard]] std::int32_t lora_slot(std::int32_t adapter) const;
+    // A slot is pinned while any lane holds KV or GDN state its occupant produced, whether the
+    // lane is generating or merely retained. Evicting such a slot would leave that state
+    // uninterpretable.
+    [[nodiscard]] bool lora_slot_pinned(std::size_t slot) const noexcept;
+
+    // Pool index resident in each slot, or -1 when the slot has never been staged. Parallel LRU
+    // stamps; the clock advances on every resolution, not only on a stage, so a repeatedly
+    // selected adapter keeps its slot.
+    std::vector<std::int32_t> lora_slot_pool_;
+    std::vector<std::uint64_t> lora_slot_used_;
+    std::uint64_t lora_clock_       = 0;
+    std::uint64_t lora_stage_count_ = 0;
+
     [[nodiscard]] cache::ContinuationImage
     export_stable_continuation(const SequenceState& sequence, const PreparedPromptData& prompt,
                                std::uint32_t frontier) const;

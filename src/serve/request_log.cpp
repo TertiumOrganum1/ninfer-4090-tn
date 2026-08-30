@@ -515,12 +515,14 @@ std::string format_server_start_json(
                               {"resource_count", load.resource_count},
                               {"load_seconds", load.load_seconds},
                               {"upload_seconds", load.upload_seconds}};
-    // Registered adapters, so a replayed log can name them even when no request used one.
+    // The discovered adapter pool, so a replayed log can name every selectable adapter even
+    // when no request used one. `count` is the pool; `slots` is how many are resident at once.
     Json adapter_names = Json::array();
     for (const std::string& name : load.lora_adapter_names) { adapter_names.push_back(name); }
     record["adapters"] = Json{{"count", load.lora_adapter_names.size()},
                               {"names", std::move(adapter_names)},
                               {"rank", load.lora_rank},
+                              {"slots", load.lora_slots},
                               {"device_bytes", load.lora_device_bytes},
                               {"file_bytes", load.lora_file_bytes}};
     record["engine"]   = Json{

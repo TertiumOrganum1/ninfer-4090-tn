@@ -154,6 +154,22 @@ bool Program<Variant>::can_admit_lane(std::uint32_t lane,
 }
 
 template <>
+bool Program<Variant>::ensure_adapter_resident(
+    std::int32_t adapter, const std::function<void(std::uint32_t)>& release_retained) {
+    return impl_->ensure_adapter_resident(adapter, release_retained);
+}
+
+template <>
+std::string Program<Variant>::adapter_scope(std::int32_t adapter) const {
+    return impl_->adapter_scope(adapter);
+}
+
+template <>
+std::uint64_t Program<Variant>::lora_stage_count() const noexcept {
+    return impl_->lora_stage_count();
+}
+
+template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane_after_retained_eviction(lane, plan);
@@ -326,10 +342,10 @@ RetainedSessionSnapshot Program<Variant>::save_retained_lane(std::uint32_t lane,
 }
 
 template <>
-std::uint32_t Program<Variant>::restore_retained_lane(std::uint32_t lane,
-                                                      std::span<const std::uint8_t> snapshot,
-                                                      std::string_view model_binding) {
-    return impl_->restore_retained_lane(lane, snapshot, model_binding);
+std::uint32_t Program<Variant>::restore_retained_lane(
+    std::uint32_t lane, std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+    const std::function<void(std::uint32_t)>& release_retained) {
+    return impl_->restore_retained_lane(lane, snapshot, model_binding, release_retained);
 }
 
 template <>

@@ -116,6 +116,13 @@ to measure here. The executable identities run Text, image/video Vision, MTP, pr
 tiered continuation reuse, CLI, OpenAI/Anthropic serving, and measurement through the same public
 `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
 
+The 27B target additionally serves externally trained LoRA adapters, discovered at startup from a
+`--lora-dir` directory and selected per request by name. The pool is unbounded and costs no device
+memory; a startup-fixed `--lora-slots` device slabs are resident and are LRU-swapped at admission.
+Adapters are normalized to the union of the pool's sites at its highest rank. Adapter training,
+merging into base weights, rescanning the directory after startup, and adapters for
+`qwen3.6-35b-a3b` are outside the current product.
+
 KV storage is selected at startup from BF16, INT8, and the rotated/E8-lattice codecs
 (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`). `rk4v4-e8` is the shipping default and serves the
 model's full native 262,144-token context on 24 GB.
@@ -240,6 +247,10 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
   `src/product/media_acquire`, CLI, or serving and is not linked into a target.
 - `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
+- `tools/convert/qwen3_8_27b` owns LoRA adapter conversion, `src/ops/lora` owns the low-rank
+  correction Op, the adapter pool and its device slots are package-owned persistent state, and
+  serving owns the model-name route table. Slot residency policy belongs to the family Program;
+  the executor decides only when to ask for it.
 - `src/serve` owns protocol translation and transport. CLI, server, and benchmark call only the
   public Engine for inference.
 - `tools/convert/<target>`, `tools/reference/<target>`, and `tools/parity/<target>` remain

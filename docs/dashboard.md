@@ -52,12 +52,18 @@ origin, so `--cors` is not required. `NINFER_BASE_URL` is validated as an origin
 
 ## Adapters
 
-Registered LoRA adapters are reported by the engine, and usage is derived from completed request
-records, so the panel distinguishes three states that a traffic-only view would conflate: an
-adapter serving requests, an adapter resident but idle (loaded, occupying VRAM, carrying no
-traffic), and an adapter that appears in a replayed log but is not registered on the engine now
-reporting. When a source reports no inventory at all — a pre-schema-15 log, or an older engine —
-the panel says residency is unknown rather than claiming an adapter is absent.
+The engine reports its adapter pool, and usage is derived from completed request records, so the
+panel distinguishes three states that a traffic-only view would conflate: an adapter serving
+requests, an adapter in the pool but idle (servable, carrying no traffic), and an adapter that
+appears in a replayed log but is not in the pool of the engine now reporting. When a source reports
+no inventory at all — a pre-schema-15 log, or an older engine — the panel says pool membership is
+unknown rather than claiming an adapter is absent.
+
+Pool membership is not device residency. The header reports the pool size beside `slots`, the number
+of adapters the bank holds on the device at once; a pool larger than its slot count is normal and
+means admission swaps adapters in as requests select them. The panel does not track which adapters
+are in slots right now, because that changes between polls and says nothing a user can act on — the
+actionable number is how much of the pool is competing for how few slots.
 
 Rows are keyed on the resolved `request.adapter`, never on the requested model id: the Anthropic
 route passes the client's own model string through and silently falls back to the base weights

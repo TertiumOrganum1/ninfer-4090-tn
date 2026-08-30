@@ -45,11 +45,16 @@ namespace ninfer::runtime {
 // Namespaces a continuation-cache alias by the adapter that produced it. Every alias is scoped,
 // including the base weights, so no unscoped key exists and two adapters can never collide. The
 // separator is ASCII unit-separator, which no session id or stable-prefix digest contains.
-inline std::string adapter_scoped_alias(std::int32_t adapter, std::string_view alias) {
-    std::string scope = adapter < 0 ? std::string("base") : "lora" + std::to_string(adapter);
-    scope += '\x1f';
-    scope += alias;
-    return scope;
+//
+// `scope` is the adapter's content fingerprint rather than its pool position or its bank slot.
+// Both of those are engine bookkeeping that changes as adapters are swapped and as the directory
+// gains or loses files, while L3 aliases persist across restarts; keying by either would let one
+// adapter inherit another's KV and GDN state.
+inline std::string adapter_scoped_alias(std::string_view scope, std::string_view alias) {
+    std::string scoped(scope);
+    scoped += '\x1f';
+    scoped += alias;
+    return scoped;
 }
 
 template <class Instance>
@@ -201,9 +206,10 @@ public:
         // A continuation produced under one adapter encodes that adapter's weights in its KV and
         // GDN recurrent state, so every cache alias is namespaced by the selected adapter. This
         // is a correctness requirement, not an optimization.
+        const std::string adapter_scope =
+            instance_.program->adapter_scope(options.execution.adapter);
         if (options.routing_hint) {
-            options.routing_hint = adapter_scoped_alias(options.execution.adapter,
-                                                        *options.routing_hint);
+            options.routing_hint = adapter_scoped_alias(adapter_scope, *options.routing_hint);
         }
 
         std::shared_ptr<Request> request;
@@ -232,10 +238,7 @@ public:
                     }
                 }
                 stable_alias = instance_.program->stable_prefix_alias(prompt);
-                if (stable_alias) {
-                    stable_alias =
-                        adapter_scoped_alias(options.execution.adapter, *stable_alias);
-                }
+                if (stable_alias) { stable_alias = adapter_scoped_alias(adapter_scope, *stable_alias); }
                 stable_boundary = targets::qwen3_8::PreparedPromptAccess::view(prompt)
                                       .identity.stable_prefix_boundary;
                 if (stable_alias) {
@@ -423,8 +426,9 @@ public:
             invalidate_lane_plans(lane);
         }
         lane_session_path_[lane].clear();
-        const std::uint32_t tokens =
-            instance_.program->restore_retained_lane(lane, snapshot, model_binding);
+        const std::uint32_t tokens = instance_.program->restore_retained_lane(
+            lane, snapshot, model_binding,
+            [this](std::uint32_t victim) { evict_retained_lane(victim); });
         invalidate_lane_plans(lane);
         if (!session_path.empty()) { lane_session_path_[lane] = session_path; }
         retained_digest_cache_[lane] = instance_.program->retained_lane_digest(lane);
@@ -2175,6 +2179,24 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    // Settles the request's adapter into a device slot after capacity and lane preflight but before
+    // continuation restore. Restore writes the adapter identity onto its lane, while residency can
+    // evict soft-retained lanes, so both sides of that ordering matter.
+    //
+    // Staging is a bounded host pass over one slab plus one contiguous upload, on the worker
+    // thread between rounds with no graph replay in flight. The bank's device addresses are fixed
+    // at load, so only its bytes change and the captured graph is untouched.
+    //
+    // False means every slot is held by a generating lane using another adapter. That is a
+    // temporal block like a full KV pool: the request stays queued until a lane frees, subject to
+    // its own deadline. It cannot deadlock, because an idle engine holds no slot.
+    [[nodiscard]] bool ensure_adapter_resident(const std::shared_ptr<Request>& request) {
+        PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
+        return instance_.program->ensure_adapter_resident(
+            request->options.execution.adapter,
+            [this](std::uint32_t lane) { evict_retained_lane(lane); });
+    }
+
     void try_restore_continuation(const std::shared_ptr<Request>& request) noexcept {
         if (request->continuation_restore_attempted && !request->continuation_restore_deferred_kv) {
             return;
@@ -2819,10 +2841,6 @@ private:
                 control_progress = true;
                 continue;
             }
-            {
-                PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
-                try_restore_continuation(head);
-            }
             const RequestPlanSummary& head_base = head->base_plan->summary();
             if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
                 (void)remove_pending_error(
@@ -2841,6 +2859,38 @@ private:
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
                 continue;
+            }
+            if (head_lane) {
+                bool adapter_resident = false;
+                try {
+                    adapter_resident = ensure_adapter_resident(head);
+                } catch (...) {
+                    (void)remove_pending_error(head, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                if (!adapter_resident) {
+                    // This is adapter-only contention, not a resource frontier. Feeding it to the
+                    // KV/lane protection policy would violate that policy's blocked-by-resources
+                    // precondition. Drain until a pinned slot is released; the head is checked
+                    // before backfill on every pass.
+                    return control_progress ? AdmissionProgress::ControlProgress
+                                            : AdmissionProgress::None;
+                }
+                {
+                    PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
+                    try_restore_continuation(head);
+                }
+                // Residency may have evicted a soft-retained lane, and restore may have imported
+                // a deeper candidate, so the preflight lane choice is no longer authoritative.
+                try {
+                    PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
+                    head_lane = find_admission_lane(head);
+                } catch (...) {
+                    (void)remove_pending_error(head, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
             }
             if (head_lane) {
                 PhaseTimer timer(cumulative_stats_.worker_admission_commit_seconds);
@@ -2896,10 +2946,6 @@ private:
                     control_progress = true;
                     continue;
                 }
-                {
-                    PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
-                    try_restore_continuation(candidate);
-                }
                 const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
                 if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
                     (void)remove_pending_error(
@@ -2931,6 +2977,41 @@ private:
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
+                    // Only mutate slot residency after this candidate has a lane and is safe to
+                    // backfill. A candidate rejected above must not evict unrelated retained state
+                    // merely because the scheduler examined it.
+                    try {
+                        if (!ensure_adapter_resident(candidate)) { continue; }
+                    } catch (...) {
+                        (void)remove_pending_error(candidate, std::current_exception());
+                        control_progress = true;
+                        continue;
+                    }
+                    {
+                        PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
+                        try_restore_continuation(candidate);
+                    }
+                    try {
+                        candidate_lane = find_admission_lane(candidate);
+                    } catch (...) {
+                        (void)remove_pending_error(candidate, std::current_exception());
+                        control_progress = true;
+                        continue;
+                    }
+                    if (!candidate_lane) { continue; }
+                    const RequestPlanSummary& restored_plan =
+                        candidate->lane_plans[candidate_lane->lane]->summary();
+                    backfill = BackfillClass::None;
+                    if (persistent_backfill_is_safe(*protection_, active.span(),
+                                                    restored_plan.admission,
+                                                    admission_capacity_)) {
+                        backfill = BackfillClass::Persistent;
+                    } else if (restored_plan.service_work_quanta <= frontier_distance &&
+                               restored_plan.service_work_quanta <=
+                                   protection_->temporal_credit) {
+                        backfill = BackfillClass::Temporal;
+                    }
+                    if (backfill == BackfillClass::None) { continue; }
                     return admit_planned_request(candidate, *candidate_lane, backfill,
                                                  protection_->epoch_id);
                 }

@@ -102,9 +102,12 @@ export interface SpeculativeStats {
  * weights arena and is otherwise visible only as a reduction in free memory.
  */
 export interface AdapterInventory {
+  /** Discovered pool size. Every entry is selectable regardless of what is resident. */
   count: number
   names: string[]
   rank: number
+  /** Device-resident slots the pool is swapped through. Absent in logs written before slots. */
+  slots?: number
   device_bytes: number
   file_bytes: number
   /** Served model ids, `/telemetry` only; `server_start` reports names alone. */
@@ -158,7 +161,7 @@ export interface ServerStartRecord extends RecordEnvelope {
       persist_min_tokens: number
     }
   }
-  /** Resident LoRA bank, present from schema 15. Names appear even with no adapter traffic. */
+  /** Discovered LoRA pool, present from schema 15. Names appear even with no adapter traffic. */
   adapters?: AdapterInventory
   environment: {
     device: number

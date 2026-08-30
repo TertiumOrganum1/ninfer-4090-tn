@@ -23,6 +23,11 @@ inline constexpr std::size_t kFullAttentionLayers = 10;
 inline constexpr std::size_t kGdnLayers           = 30;
 inline constexpr std::size_t kDFlashLayers        = 6;
 
+// This target's post-mixer is a sparse MoE whose down projection is per-expert and outside the
+// registered additive site contract, so it has no adapter pool. The model view still names a
+// pool type; it is never defined and the `lora` view is never populated.
+class AbsentLoraPool;
+
 struct MoePlan {
     artifact::ObjectHandle router_shared_gate;
     artifact::ObjectHandle routed_gate_up;
@@ -129,7 +134,8 @@ struct GdnProjectionPayload {
 using RuntimeModelView =
     qwen3_8::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       qwen3_8::DFlashWeights<kDFlashLayers>, kFullAttentionLayers, kGdnLayers>;
+                       qwen3_8::DFlashWeights<kDFlashLayers>, AbsentLoraPool, kFullAttentionLayers,
+                       kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

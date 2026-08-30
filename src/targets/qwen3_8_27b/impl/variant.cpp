@@ -1,5 +1,7 @@
 #include "targets/qwen3_8_27b/impl/variant.h"
 
+#include "targets/qwen3_8_27b/impl/load/lora_bindings.h"
+
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -305,7 +307,7 @@ void Variant::post_mixer_lora(const Tensor& hidden, const PostMixerWeights& weig
 
     ops::LoraGroup group;
     group.rank          = lora.rank;
-    group.adapter_count = lora.adapter_count;
+    group.adapter_count = lora.slot_count;
     group.site_count    = 1;
     group.sites[0]      = ops::LoraSite{
         .a                = lora.site->a.data,
@@ -317,6 +319,20 @@ void Variant::post_mixer_lora(const Tensor& hidden, const PostMixerWeights& weig
     };
     std::array<Tensor*, 1> destinations{&residual};
     ops::lora_delta_add(activation, group, *lora.adapter_index, destinations, workspace, stream);
+}
+
+void Variant::lora_prepare_slot(const ModelView& model, std::size_t index) {
+    if (!model.lora || model.lora->pool == nullptr) {
+        throw std::logic_error("no LoRA bank is attached to this model");
+    }
+    model.lora->pool->prepare(index);
+}
+
+void Variant::lora_commit_slot(const ModelView& model, std::uint32_t slot, DeviceContext& device) {
+    if (!model.lora || model.lora->pool == nullptr) {
+        throw std::logic_error("no LoRA bank is attached to this model");
+    }
+    model.lora->pool->commit(slot, device);
 }
 
 std::size_t Variant::post_mixer_lora_workspace_capacity_bytes(WeightsProfile weights_profile,

@@ -162,6 +162,15 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
+    if (!load.lora_adapter_names.empty()) {
+        print_metric("LoRA pool",
+                     std::to_string(load.lora_adapter_names.size()) + " adapters / " +
+                         std::to_string(load.lora_slots) + " resident slots / rank " +
+                         std::to_string(load.lora_rank));
+        for (const std::string& name : load.lora_adapter_names) {
+            print_metric("LoRA adapter", name);
+        }
+    }
 }
 
 void print_generation_summary(const ninfer::GenerationResult& result,
@@ -296,7 +305,7 @@ int main(int argc, char** argv) {
         engine_options.vision_max_tokens = cli.vision_max_tokens;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.lora_adapters  = cli.lora_adapters;
+        engine_options.lora           = cli.lora;
         engine_options.load_progress  = load_progress.callback();
 
         const auto load_started = Clock::now();

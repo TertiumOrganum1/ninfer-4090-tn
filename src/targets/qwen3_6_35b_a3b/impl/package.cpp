@@ -91,11 +91,10 @@ LoraAttachment Package::attach_lora(LoadedModel& model, const EngineOptions& opt
                                     DeviceContext& device) {
     (void)model;
     (void)device;
-    if (!options.lora_adapters.empty()) {
+    if (!options.lora.directory.empty()) {
         throw std::invalid_argument("target '" + std::string(target_key) +
-                                    "' registers no LoRA site table, so it cannot load the " +
-                                    std::to_string(options.lora_adapters.size()) +
-                                    " registered adapter(s)");
+                                    "' registers no LoRA site table, so it cannot load adapters"
+                                    " from '" + options.lora.directory.string() + "'");
     }
     return {};
 }

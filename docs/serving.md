@@ -76,7 +76,10 @@ ids, shared rank, and device/file bytes). NVML failure is reported as `gpu.avail
 with an `error` string rather than failing the request.
 
 The adapter bank is one device arena committed at startup, outside the weights arena and before
-KV capacity is resolved. `memory.lora_bank_bytes` reports it so the division of the board
+KV capacity is resolved. It holds `--lora-slots` slabs, not one per servable adapter: the pool
+discovered from `--lora-dir` is unbounded and costs no device memory, and an adapter outside the
+slots is swapped in when a request for it is admitted. `adapters.slots` reports the resident count
+beside the pool, and `memory.lora_bank_bytes` reports the arena so the division of the board
 accounts for it; without that field the bank is visible only as reduced free memory. Adapter
 names come from the load summary rather than from served model ids, so an adapter that has taken
 no traffic is still reported.
@@ -128,8 +131,8 @@ session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. Th
 backend is not supported.
 
 When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry. The snapshot format is version 3, which always records both the
-registered adapter set and the ring section; earlier versions are rejected. The restored
+about 147 MiB per entry. The snapshot format is version 4, which always records both the
+adapter fingerprint and the ring section; earlier versions are rejected. The restored
 ring lets a later mid-history edit reuse the session; see
 [turn-checkpoint-ring.md](turn-checkpoint-ring.md).
 

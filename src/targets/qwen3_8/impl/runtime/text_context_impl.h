@@ -355,8 +355,8 @@ void TextContext::bind() {
 void TextContext::bind_uniform_adapter(cudaStream_t stream) {
     active_adapters_ = nullptr;
     if (!weights_.lora || uniform_adapter_ < 0) { return; }
-    if (uniform_adapter_ >= static_cast<std::int32_t>(weights_.lora->adapters)) {
-        throw std::invalid_argument("selected LoRA adapter index is outside the resident bank");
+    if (uniform_adapter_ >= static_cast<std::int32_t>(weights_.lora->slots)) {
+        throw std::invalid_argument("selected LoRA slot is outside the resident bank");
     }
     uniform_adapter_storage_ = work_.alloc(DType::I32, {1});
     copy_i32(&uniform_adapter_, uniform_adapter_storage_, stream);
@@ -370,7 +370,7 @@ void TextContext::lora_apply(std::initializer_list<LoraDestination> sites, const
     if (active_adapters_ == nullptr || !weights_.lora) { return; }
     ops::LoraGroup group;
     group.rank          = weights_.lora->rank;
-    group.adapter_count = static_cast<std::int32_t>(weights_.lora->adapters);
+    group.adapter_count = static_cast<std::int32_t>(weights_.lora->slots);
 
     std::array<Tensor*, ops::kMaximumLoraSites> destinations{};
     std::int32_t count = 0;
@@ -1057,7 +1057,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
             .site          = m.lora_down,
             .adapter_index = active_adapters_,
             .rank          = weights_.lora->rank,
-            .adapter_count = static_cast<std::int32_t>(weights_.lora->adapters),
+            .slot_count    = static_cast<std::int32_t>(weights_.lora->slots),
         };
         if (post_mixer_with_lora<Variant>(h, *m.payload, x, lora, ph, work_, s)) { return; }
     }

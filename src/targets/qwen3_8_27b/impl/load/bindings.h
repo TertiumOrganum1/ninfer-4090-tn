@@ -26,6 +26,9 @@ inline constexpr std::size_t kTextLayers          = 64;
 inline constexpr std::size_t kFullAttentionLayers = 16;
 inline constexpr std::size_t kGdnLayers           = 48;
 
+// Defined in lora_bindings.h, which needs this header's dimensions and model view.
+class LoraBank;
+
 struct WeightPlan {
     artifact::ObjectHandle object;
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
@@ -172,7 +175,7 @@ struct MtpAttentionPayload {
 using RuntimeModelView =
     qwen3_8::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
                        MtpAttentionPayload, DensePostMixerPayload, qwen3_8::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers>;
+                       LoraBank, kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
@@ -180,6 +183,8 @@ using MtpWeights           = RuntimeModelView::MtpLayer;
 class LoadedModelData {
 public:
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    // Out of line because `LoraBank` is incomplete here.
+    ~LoadedModelData();
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -189,10 +194,11 @@ public:
     artifact::MaterializedArtifact backing;
     qwen3_8::FrontendResources frontend;
     RuntimeModelView runtime;
-    // Owns the resident LoRA bank the model view points into. Empty unless adapters were
-    // registered at startup.
-    std::unique_ptr<DeviceArena> lora_arena;
-    std::vector<std::string> lora_adapter_names;
+    // Owns the adapter pool and the device slots the model view points into, and performs the
+    // staging the family's residency policy asks for. Null unless a pool was discovered. Held by
+    // pointer so a `const LoadedModelData&` still reaches a mutable bank: residency changes while
+    // the model itself does not.
+    std::unique_ptr<LoraBank> lora_bank;
 };
 
 class LoadedModel::Impl {

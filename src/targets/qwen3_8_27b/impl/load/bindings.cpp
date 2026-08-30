@@ -1,6 +1,7 @@
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
+#include "targets/qwen3_8_27b/impl/load/lora_bindings.h" // complete LoraBank for ~LoadedModelData
 
 #include <algorithm>
 #include <array>
@@ -411,6 +412,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     load_plan.materialization = binder.finish();
     return load_plan;
 }
+
+LoadedModelData::~LoadedModelData() = default;
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {

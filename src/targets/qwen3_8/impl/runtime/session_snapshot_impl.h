@@ -31,12 +31,17 @@ namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
 namespace {
 
 constexpr char kSessionSnapshotMagic[8] = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
-// Version 3 records the LoRA adapter that produced the session and appends the host
-// turn-checkpoint ring after the KV payload. Both are unconditional: the ring section is always
-// written, empty or not, so one reader shape covers every image. Older versions cannot be
-// restored - they carry adapter-dependent KV and GDN state with no way to say which adapter
-// produced it, and guessing base would hand an adapter's state to an unadapted request.
-constexpr std::uint32_t kSessionSnapshotVersion = 3;
+// Version 4 records the producing LoRA adapter by its 32-byte artifact content fingerprint and
+// appends the host turn-checkpoint ring after the KV payload. Both are unconditional: the ring
+// section is always written, empty or not, so one reader shape covers every image.
+//
+// Version 3 recorded a bank index instead. That was only sound while the bank was startup-fixed
+// and index-identical across processes; with a swapped slot pool an index names whichever
+// adapter happens to occupy that position, so a v3 image would hand one adapter's KV and GDN
+// state to another. Older versions cannot be restored.
+constexpr std::uint32_t kSessionSnapshotVersion = 4;
+// All-zero marks the base weights. A real SHA-256 of an artifact is not zero.
+using SnapshotAdapterFingerprint = std::array<std::uint8_t, 32>;
 constexpr std::uint32_t kSessionSnapshotMaxRingEntries = 64;
 
 constexpr std::uint32_t kKvFlagPackedV    = 1U << 0;
@@ -205,10 +210,10 @@ struct SnapshotSession {
     std::uint32_t turn_checkpoint_frontier = 0;
     std::uint32_t text_pages               = 0;
     std::uint32_t backend_pages            = 0;
-    // Bank index of the adapter that produced this session, or -1 for the base weights. The
-    // model binding already pins the registered name list and its order, so the index resolves
-    // to the same adapter on restore or the binding comparison rejects the image first.
-    std::int32_t adapter = -1;
+    // Content fingerprint of the adapter that produced this session; all-zero for the base
+    // weights. Restore resolves it against the current pool, so an adapter that moved position,
+    // changed slot, or was retrained under the same file name cannot be handed this state.
+    SnapshotAdapterFingerprint adapter{};
 };
 
 void write_config(SnapshotWriter& writer, const SnapshotConfig& config) {
@@ -259,7 +264,7 @@ void write_session(SnapshotWriter& writer, const SnapshotSession& session) {
     writer.pod(session.turn_checkpoint_frontier);
     writer.pod(session.text_pages);
     writer.pod(session.backend_pages);
-    writer.pod(session.adapter);
+    writer.bytes(session.adapter.data(), session.adapter.size());
 }
 
 SnapshotSession read_session(SnapshotReader& reader) {
@@ -275,8 +280,13 @@ SnapshotSession read_session(SnapshotReader& reader) {
     session.turn_checkpoint_frontier = reader.pod<std::uint32_t>();
     session.text_pages               = reader.pod<std::uint32_t>();
     session.backend_pages            = reader.pod<std::uint32_t>();
-    session.adapter                  = reader.pod<std::int32_t>();
+    reader.bytes(session.adapter.data(), session.adapter.size());
     return session;
+}
+
+bool is_base_adapter(const SnapshotAdapterFingerprint& fingerprint) noexcept {
+    return std::all_of(fingerprint.begin(), fingerprint.end(),
+                       [](std::uint8_t byte) { return byte == 0; });
 }
 
 // Session identity: FNV-1a 64 over the resident ledger's token bytes, rendered as 16 hex
@@ -398,7 +408,13 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     session.turn_checkpoint_frontier = sequence.turn_checkpoint.frontier;
     session.text_pages               = static_cast<std::uint32_t>(text_pages.size());
     session.backend_pages            = static_cast<std::uint32_t>(backend_pages.size());
-    session.adapter                  = sequence.adapter;
+    if (sequence.adapter >= 0) {
+        if (!model.lora ||
+            static_cast<std::size_t>(sequence.adapter) >= model.lora->fingerprints.size()) {
+            throw std::logic_error("saved session names a LoRA adapter outside the pool");
+        }
+        session.adapter = model.lora->fingerprints[static_cast<std::size_t>(sequence.adapter)];
+    }
 
     // The ring is written unconditionally, so only its length is bounded here.
     const std::size_t ring_skip =
@@ -502,9 +518,9 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     return snapshot;
 }
 
-std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
-                                                     std::span<const std::uint8_t> snapshot,
-                                                     std::string_view model_binding) {
+std::uint32_t ProgramImplCore::restore_retained_lane(
+    std::uint32_t lane, std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+    const std::function<void(std::uint32_t)>& release_retained) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     RequestControl& request = requests[lane];
     SequenceState& sequence = sequences[lane];
@@ -586,10 +602,21 @@ std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
     }
     // The restored KV and FP32 GDN state encode the adapter that produced them, so the lane must
     // carry that identity or prefix reuse would splice it into a request using other weights.
-    const auto resident_adapters =
-        model.lora ? static_cast<std::int32_t>(model.lora->adapters) : 0;
-    if (session.adapter < -1 || session.adapter >= resident_adapters) {
-        throw std::invalid_argument("session snapshot names a LoRA adapter that is not resident");
+    // Resolving by fingerprint rather than by position means an adapter that moved in the pool
+    // still matches, and a different adapter that took its position cannot.
+    std::int32_t restored_adapter = -1;
+    if (!is_base_adapter(session.adapter)) {
+        if (!model.lora) {
+            throw std::invalid_argument(
+                "session snapshot names a LoRA adapter but this engine loaded no pool");
+        }
+        const auto& fingerprints = model.lora->fingerprints;
+        const auto found = std::find(fingerprints.begin(), fingerprints.end(), session.adapter);
+        if (found == fingerprints.end()) {
+            throw std::invalid_argument(
+                "session snapshot names a LoRA adapter that is not in this engine's pool");
+        }
+        restored_adapter = static_cast<std::int32_t>(found - fingerprints.begin());
     }
     if (session.ledger_frontier != session.tokens ||
         session.execution_frontier > session.tokens ||
@@ -697,6 +724,14 @@ std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
         throw std::invalid_argument(
             "session snapshot does not fit the free KV capacity; evict other sessions first");
     }
+    // Settle residency only after the complete image and its capacity have been validated. Slot
+    // replacement can demote retained lanes, which a malformed or non-fitting image must not do.
+    if (restored_adapter >= 0 &&
+        !ensure_adapter_resident(restored_adapter, release_retained)) {
+        throw std::invalid_argument(
+            "every LoRA slot is held by a running session, so this snapshot's adapter cannot be"
+            " made resident; retry when a slot frees");
+    }
 
     try {
         reserve_sequence_kv(sequence, session.text_pages, session.backend_pages);
@@ -749,7 +784,7 @@ std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
         sequence.rope_delta               = session.rope_delta;
         sequence.mtp_draft_count          = 0;
         sequence.tail_hidden_valid        = session.tail_hidden_valid != 0;
-        sequence.adapter                  = session.adapter;
+        sequence.adapter                  = restored_adapter;
         sequence.turn_checkpoint          = TurnCheckpoint{
                      .valid    = session.turn_checkpoint_valid != 0,
                      .frontier = session.turn_checkpoint_frontier,

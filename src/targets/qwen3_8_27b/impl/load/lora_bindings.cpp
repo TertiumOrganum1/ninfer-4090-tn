@@ -1,15 +1,18 @@
 #include "targets/qwen3_8_27b/impl/load/lora_bindings.h"
 
-#include "artifact/reader.h"
 #include "artifact/typed_binding.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <initializer_list>
-#include <span>
 #include <map>
+#include <memory>
 #include <set>
+#include <span>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <variant>
 
@@ -47,292 +50,573 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-// Accumulates slab offsets while binding, so a shared factor is bound and placed exactly once.
+// Object names of one registered site, and the shapes its factors must carry.
+struct SiteNames {
+    std::string a;
+    std::string b;
+    std::int32_t columns = 0; // K, the activation width lora_a reads
+    std::int32_t rows    = 0; // N, the destination height lora_b writes
+};
+
+SiteNames query_gate_a_names(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/query_gate/lora_a",
+                     .b       = {},
+                     .columns = kHidden,
+                     .rows    = 0};
+}
+
+SiteNames query_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/query_gate/lora_a",
+                     .b       = layer_prefix(layer) + "attention/query/lora_b",
+                     .columns = kHidden,
+                     .rows    = kQuerySize};
+}
+
+SiteNames gate_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/query_gate/lora_a",
+                     .b       = layer_prefix(layer) + "attention/gate/lora_b",
+                     .columns = kHidden,
+                     .rows    = kQuerySize};
+}
+
+SiteNames key_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/key/lora_a",
+                     .b       = layer_prefix(layer) + "attention/key/lora_b",
+                     .columns = kHidden,
+                     .rows    = kKeyValueSize};
+}
+
+SiteNames value_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/value/lora_a",
+                     .b       = layer_prefix(layer) + "attention/value/lora_b",
+                     .columns = kHidden,
+                     .rows    = kKeyValueSize};
+}
+
+SiteNames attention_output_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "attention/output/lora_a",
+                     .b       = layer_prefix(layer) + "attention/output/lora_b",
+                     .columns = kAttentionValues,
+                     .rows    = kHidden};
+}
+
+SiteNames gdn_output_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "gdn/output/lora_a",
+                     .b       = layer_prefix(layer) + "gdn/output/lora_b",
+                     .columns = kGdnValues,
+                     .rows    = kHidden};
+}
+
+SiteNames mlp_down_site(std::size_t layer) {
+    return SiteNames{.a       = layer_prefix(layer) + "mlp/down/lora_a",
+                     .b       = layer_prefix(layer) + "mlp/down/lora_b",
+                     .columns = kIntermediate,
+                     .rows    = kHidden};
+}
+
+// Reads one factor's descriptor and checks it against the registered shape. Returns its rank,
+// or nullopt when the object is absent. Shape errors are hard: an adapter that names a
+// registered object must carry it at the registered width.
+std::optional<std::int32_t> factor_rank(const artifact::Reader& reader, const std::string& name,
+                                        std::int32_t expected_other, bool rank_is_leading) {
+    const artifact::ObjectDescriptor* object = reader.find(name);
+    if (object == nullptr) { return std::nullopt; }
+    const auto* tensor = std::get_if<artifact::TensorDescriptor>(object);
+    if (tensor == nullptr || tensor->shape.size() != 2) {
+        throw artifact::ArtifactError(name + ": a LoRA factor must be a rank-two tensor");
+    }
+    if (tensor->format != NumericFormat::BF16 ||
+        tensor->layout != artifact::StorageLayout::ContiguousLeV1) {
+        throw artifact::ArtifactError(name + ": a LoRA factor must be BF16 contiguous-le-v1");
+    }
+    const std::uint64_t rank  = rank_is_leading ? tensor->shape[0] : tensor->shape[1];
+    const std::uint64_t other = rank_is_leading ? tensor->shape[1] : tensor->shape[0];
+    if (other != static_cast<std::uint64_t>(expected_other)) {
+        throw artifact::ArtifactError(name + ": expected extent " +
+                                      std::to_string(expected_other) + ", found " +
+                                      std::to_string(other));
+    }
+    return static_cast<std::int32_t>(rank);
+}
+
+// Reads a private two-factor site. Both factors are required or neither may appear.
+bool read_site(const artifact::Reader& reader, const SiteNames& site, std::int32_t& rank,
+               std::string_view label) {
+    const std::optional<std::int32_t> a = factor_rank(reader, site.a, site.columns, true);
+    const std::optional<std::int32_t> b = factor_rank(reader, site.b, site.rows, false);
+    if (!a && !b) { return false; }
+    if (!a || !b) {
+        throw artifact::ArtifactError("LoRA site '" + std::string(label) +
+                                      "' is incomplete: both factors are required");
+    }
+    if (*a != *b) {
+        throw artifact::ArtifactError("LoRA site '" + std::string(label) +
+                                      "' disagrees on rank between its two factors");
+    }
+    if (rank != 0 && rank != *a) {
+        throw artifact::ArtifactError("LoRA site '" + std::string(label) + "' has rank " +
+                                      std::to_string(*a) + ", but the artifact already uses " +
+                                      std::to_string(rank) +
+                                      "; one artifact carries exactly one rank");
+    }
+    rank = *a;
+    return true;
+}
+
+// Reads the shared query/gate group: one down-projection factor and two up-projections.
+bool read_query_gate(const artifact::Reader& reader, std::size_t layer, std::int32_t& rank) {
+    const SiteNames shared = query_gate_a_names(layer);
+    const SiteNames query  = query_site(layer);
+    const SiteNames gate   = gate_site(layer);
+    const std::optional<std::int32_t> a = factor_rank(reader, shared.a, shared.columns, true);
+    const std::optional<std::int32_t> q = factor_rank(reader, query.b, query.rows, false);
+    const std::optional<std::int32_t> g = factor_rank(reader, gate.b, gate.rows, false);
+    if (!a && !q && !g) { return false; }
+    if (!a || !q || !g) {
+        throw artifact::ArtifactError(
+            "LoRA attention query/gate group in layer " + std::to_string(layer) +
+            " is incomplete: the shared lora_a and both lora_b factors are required");
+    }
+    if (*a != *q || *a != *g) {
+        throw artifact::ArtifactError("LoRA attention query/gate group in layer " +
+                                      std::to_string(layer) + " disagrees on rank");
+    }
+    if (rank != 0 && rank != *a) {
+        throw artifact::ArtifactError("LoRA attention query/gate group in layer " +
+                                      std::to_string(layer) + " has rank " + std::to_string(*a) +
+                                      ", but the artifact already uses " + std::to_string(rank) +
+                                      "; one artifact carries exactly one rank");
+    }
+    rank = *a;
+    return true;
+}
+
+// Walks the whole registered site table against one artifact, producing its inventory and rank.
+void read_inventory(const artifact::Reader& reader, LoraInventory& inventory,
+                    std::int32_t& rank) {
+    std::set<std::string, std::less<>> registered_objects;
+    const auto register_site = [&](const SiteNames& site) {
+        registered_objects.insert(site.a);
+        registered_objects.insert(site.b);
+    };
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        if (is_full_attention_layer(layer)) {
+            registered_objects.insert(query_gate_a_names(layer).a);
+            registered_objects.insert(query_site(layer).b);
+            registered_objects.insert(gate_site(layer).b);
+            register_site(key_site(layer));
+            register_site(value_site(layer));
+            register_site(attention_output_site(layer));
+            register_site(mlp_down_site(layer));
+            LoraFullLayerInventory& full = inventory.full_layers[full_attention_index(layer)];
+            full.query_gate              = read_query_gate(reader, layer, rank);
+            full.key    = read_site(reader, key_site(layer), rank, "attention/key");
+            full.value  = read_site(reader, value_site(layer), rank, "attention/value");
+            full.output = read_site(reader, attention_output_site(layer), rank,
+                                    "attention/output");
+            full.down   = read_site(reader, mlp_down_site(layer), rank, "mlp/down");
+        } else {
+            register_site(gdn_output_site(layer));
+            register_site(mlp_down_site(layer));
+            LoraGdnLayerInventory& gdn = inventory.gdn_layers[gdn_index(layer)];
+            gdn.output = read_site(reader, gdn_output_site(layer), rank, "gdn/output");
+            gdn.down   = read_site(reader, mlp_down_site(layer), rank, "mlp/down");
+        }
+    }
+    for (const artifact::ObjectDescriptor& object : reader.objects()) {
+        const std::string_view name = artifact::object_name(object);
+        if (!registered_objects.contains(name)) {
+            throw artifact::ArtifactError("unregistered LoRA object '" + std::string(name) + "'");
+        }
+    }
+}
+
+// Assigns slab offsets for the profile's inventory. A factor named by two sites - the shared
+// query/gate down-projection - is placed exactly once.
 class SlabBuilder {
 public:
-    SlabBuilder(artifact::Binder& binder, const artifact::Reader& reader, std::int32_t rank,
-                LoraBindingPlan& plan)
-        : binder_(binder), reader_(reader), rank_(rank), plan_(plan) {}
-
-    [[nodiscard]] bool has(const std::string& name) const {
-        return reader_.find(name) != nullptr;
-    }
-
-    // Binds `name` if it has not been placed yet and returns its slab offset.
     std::uint64_t place(const std::string& name, std::int32_t rows, std::int32_t columns) {
         const auto existing = placed_.find(name);
         if (existing != placed_.end()) { return existing->second; }
-        const artifact::ObjectHandle object = artifact::bind_device_tensor(
-            binder_, name, NumericFormat::BF16,
-            {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)});
         const auto bytes =
             static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(columns) * 2U;
         const std::uint64_t offset = cursor_;
         cursor_                    = align_up(cursor_ + bytes, kSlabAlignment);
-        plan_.objects.push_back(
-            LoraObjectPlacement{.object = object, .offset = offset, .bytes = bytes});
         placed_.emplace(name, offset);
         return offset;
     }
 
-    [[nodiscard]] std::uint64_t slab_bytes() const { return cursor_; }
-
-    [[nodiscard]] std::int32_t rank() const { return rank_; }
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return cursor_; }
 
 private:
-    artifact::Binder& binder_;
-    const artifact::Reader& reader_;
-    std::int32_t rank_;
-    LoraBindingPlan& plan_;
     std::map<std::string, std::uint64_t> placed_;
     std::uint64_t cursor_ = 0;
 };
 
-// Binds a site whose two factors are private to it.
-LoraSitePlan bind_private_site(SlabBuilder& slab, const std::string& a_name,
-                               const std::string& b_name, std::int32_t in_features,
-                               std::int32_t out_features, std::string_view label) {
-    const bool has_a = slab.has(a_name);
-    const bool has_b = slab.has(b_name);
-    if (!has_a && !has_b) { return LoraSitePlan{}; }
-    if (has_a != has_b) {
-        throw artifact::ArtifactError("LoRA site '" + std::string(label) +
-                                      "' is incomplete: both factors are required");
-    }
+LoraSitePlan place_site(SlabBuilder& slab, const SiteNames& site, std::int32_t rank) {
     return LoraSitePlan{
-        .a_offset = slab.place(a_name, slab.rank(), in_features),
-        .b_offset = slab.place(b_name, out_features, slab.rank()),
-        .rows     = out_features,
+        .a_offset = slab.place(site.a, rank, site.columns),
+        .b_offset = slab.place(site.b, site.rows, rank),
+        .rows     = site.rows,
+        .columns  = site.columns,
         .present  = true,
     };
 }
 
-void bind_full_layer(SlabBuilder& slab, std::size_t layer, LoraFullLayerPlan& plan) {
-    const std::string prefix = layer_prefix(layer);
-
-    // The attention parent stores query rows followed by output-gate rows for each head, so the
-    // two sites are row selections of one source module and share one down-projection factor.
-    const std::string shared_a = prefix + "attention/query_gate/lora_a";
-    const std::string query_b  = prefix + "attention/query/lora_b";
-    const std::string gate_b   = prefix + "attention/gate/lora_b";
-    const bool any_query_gate  = slab.has(shared_a) || slab.has(query_b) || slab.has(gate_b);
-    if (any_query_gate) {
-        if (!slab.has(shared_a) || !slab.has(query_b) || !slab.has(gate_b)) {
-            throw artifact::ArtifactError(
-                "LoRA attention query/gate group in layer " + std::to_string(layer) +
-                " is incomplete: the shared lora_a and both lora_b factors are required");
-        }
-        const std::uint64_t a_offset = slab.place(shared_a, slab.rank(), kHidden);
-        plan.query                   = LoraSitePlan{.a_offset = a_offset,
-                                                    .b_offset = slab.place(query_b, kQuerySize,
-                                                                           slab.rank()),
-                                                    .rows     = kQuerySize,
-                                                    .present  = true};
-        plan.gate                    = LoraSitePlan{.a_offset = a_offset,
-                                                    .b_offset = slab.place(gate_b, kQuerySize,
-                                                                           slab.rank()),
-                                                    .rows     = kQuerySize,
-                                                    .present  = true};
-    }
-
-    plan.key    = bind_private_site(slab, prefix + "attention/key/lora_a",
-                                    prefix + "attention/key/lora_b", kHidden, kKeyValueSize,
-                                    "attention/key");
-    plan.value  = bind_private_site(slab, prefix + "attention/value/lora_a",
-                                    prefix + "attention/value/lora_b", kHidden, kKeyValueSize,
-                                    "attention/value");
-    plan.output = bind_private_site(slab, prefix + "attention/output/lora_a",
-                                    prefix + "attention/output/lora_b", kAttentionValues, kHidden,
-                                    "attention/output");
-    plan.down   = bind_private_site(slab, prefix + "mlp/down/lora_a", prefix + "mlp/down/lora_b",
-                                    kIntermediate, kHidden, "mlp/down");
-}
-
-void bind_gdn_layer(SlabBuilder& slab, std::size_t layer, LoraGdnLayerPlan& plan) {
-    const std::string prefix = layer_prefix(layer);
-    plan.output = bind_private_site(slab, prefix + "gdn/output/lora_a",
-                                    prefix + "gdn/output/lora_b", kGdnValues, kHidden,
-                                    "gdn/output");
-    plan.down   = bind_private_site(slab, prefix + "mlp/down/lora_a", prefix + "mlp/down/lora_b",
-                                    kIntermediate, kHidden, "mlp/down");
-}
-
-// Rank is a property of the artifact, not of the request. It is read from the first registered
-// down-projection factor present, then enforced on every other object by exact shape binding.
-std::int32_t discover_rank(const artifact::Reader& reader) {
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        const std::string prefix = layer_prefix(layer);
-        // Held by value: a braced-init-list selected through a conditional would not have its
-        // backing array's lifetime extended.
-        static constexpr std::array<std::pair<const char*, std::int32_t>, 5> kFullCandidates{
-            {{"attention/query_gate/lora_a", kHidden},
-             {"attention/key/lora_a", kHidden},
-             {"attention/value/lora_a", kHidden},
-             {"attention/output/lora_a", kAttentionValues},
-             {"mlp/down/lora_a", kIntermediate}}};
-        static constexpr std::array<std::pair<const char*, std::int32_t>, 2> kGdnCandidates{
-            {{"gdn/output/lora_a", kGdnValues}, {"mlp/down/lora_a", kIntermediate}}};
-        const std::span<const std::pair<const char*, std::int32_t>> candidates =
-            is_full_attention_layer(layer)
-                ? std::span<const std::pair<const char*, std::int32_t>>(kFullCandidates)
-                : std::span<const std::pair<const char*, std::int32_t>>(kGdnCandidates);
-        for (const auto& [suffix, in_features] : candidates) {
-            const std::string name                   = prefix + suffix;
-            const artifact::ObjectDescriptor* object = reader.find(name);
-            if (object == nullptr) { continue; }
-            const auto* tensor = std::get_if<artifact::TensorDescriptor>(object);
-            if (tensor == nullptr || tensor->shape.size() != 2) {
-                throw artifact::ArtifactError(name + ": a LoRA factor must be a rank-two tensor");
-            }
-            if (tensor->shape[1] != static_cast<std::uint64_t>(in_features)) {
-                throw artifact::ArtifactError(name + ": lora_a must have " +
-                                              std::to_string(in_features) + " columns, found " +
-                                              std::to_string(tensor->shape[1]));
-            }
-            const auto rank = static_cast<std::int32_t>(tensor->shape[0]);
-            if (!registered_rank(rank)) {
-                throw artifact::ArtifactError(name + ": LoRA rank " + std::to_string(rank) +
-                                              " is not registered; supported ranks are 8, 16, 32,"
-                                              " 64");
-            }
-            return rank;
-        }
-    }
-    throw artifact::ArtifactError(
-        "LoRA artifact carries no registered site object, so it corrects nothing");
-}
-
-qwen3_8::LoraSiteWeights bind_site_view(const LoraSitePlan& plan, void* slab_base,
-                                        std::uint64_t slab_bytes, std::int32_t rank,
-                                        std::int32_t in_features) {
+qwen3_8::LoraSiteWeights bind_site_view(const LoraSitePlan& plan, unsigned char* slab_base,
+                                        std::uint64_t slab_bytes, std::int32_t rank) {
     if (!plan.present) { return {}; }
-    auto* bytes = static_cast<unsigned char*>(slab_base);
     qwen3_8::LoraSiteWeights view;
-    view.a = Tensor(bytes + plan.a_offset, DType::BF16, {in_features, rank});
-    view.b = Tensor(bytes + plan.b_offset, DType::BF16, {rank, plan.rows});
+    view.a = Tensor(slab_base + plan.a_offset, DType::BF16, {plan.columns, rank});
+    view.b = Tensor(slab_base + plan.b_offset, DType::BF16, {rank, plan.rows});
     view.a_adapter_stride = slab_bytes;
     view.b_adapter_stride = slab_bytes;
     return view;
 }
 
-} // namespace
-
-LoraArtifactLoadPlan bind_lora_artifact(artifact::Binder& binder, const artifact::Reader& reader) {
-    LoraArtifactLoadPlan load;
-    load.bindings.rank = discover_rank(reader);
-
-    SlabBuilder slab(binder, reader, load.bindings.rank, load.bindings);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        if (is_full_attention_layer(layer)) {
-            bind_full_layer(slab, layer, load.bindings.full_layers[full_attention_index(layer)]);
-        } else {
-            bind_gdn_layer(slab, layer, load.bindings.gdn_layers[gdn_index(layer)]);
-        }
+// Strips the conventional adapter suffixes so a pool name is the file's stem: a file named
+// `math7.lora.ninfer` is selected as `math7`.
+std::string pool_name(const std::filesystem::path& path) {
+    std::string name = path.filename().string();
+    static constexpr std::string_view kNinfer = ".ninfer";
+    static constexpr std::string_view kLora   = ".lora";
+    if (name.size() > kNinfer.size() && name.compare(name.size() - kNinfer.size(),
+                                                     kNinfer.size(), kNinfer) == 0) {
+        name.resize(name.size() - kNinfer.size());
     }
-    if (load.bindings.objects.empty()) {
-        throw artifact::ArtifactError("LoRA artifact bound no registered site object");
+    if (name.size() > kLora.size() &&
+        name.compare(name.size() - kLora.size(), kLora.size(), kLora) == 0) {
+        name.resize(name.size() - kLora.size());
     }
-    load.bindings.slab_bytes = align_up(slab.slab_bytes(), kSlabAlignment);
-    load.materialization     = binder.finish();
-    return load;
+    return name;
 }
 
-LoadedLoraBank load_lora_bank(std::span<const LoraAdapterSpec> adapters, DeviceContext& device) {
-    LoadedLoraBank bank;
-    if (adapters.empty()) { return bank; }
-    if (adapters.size() > kMaximumLoraAdapters) {
-        throw std::invalid_argument("at most " + std::to_string(kMaximumLoraAdapters) +
-                                    " LoRA adapters may be registered, received " +
-                                    std::to_string(adapters.size()));
+// Copies one factor into the pinned slab, zero-padding the rank. `stored_rank` rows or columns
+// carry the artifact's values and the remainder is zero, which contributes nothing to the
+// product and so reproduces the adapter's trained delta exactly at the bank rank.
+void stage_a_factor(unsigned char* destination, const std::byte* source, std::int32_t stored_rank,
+                    std::int32_t bank_rank, std::int32_t columns) {
+    // A is row-major [rank, columns], so the padding is a contiguous tail.
+    const std::size_t stored = static_cast<std::size_t>(stored_rank) *
+                               static_cast<std::size_t>(columns) * 2U;
+    const std::size_t total =
+        static_cast<std::size_t>(bank_rank) * static_cast<std::size_t>(columns) * 2U;
+    std::memcpy(destination, source, stored);
+    if (total > stored) { std::memset(destination + stored, 0, total - stored); }
+}
+
+void stage_b_factor(unsigned char* destination, const std::byte* source, std::int32_t stored_rank,
+                    std::int32_t bank_rank, std::int32_t rows) {
+    // B is row-major [rows, rank], so the padding is a tail inside every row.
+    const std::size_t stored_pitch = static_cast<std::size_t>(stored_rank) * 2U;
+    const std::size_t bank_pitch   = static_cast<std::size_t>(bank_rank) * 2U;
+    if (stored_pitch == bank_pitch) {
+        std::memcpy(destination, source, bank_pitch * static_cast<std::size_t>(rows));
+        return;
     }
+    for (std::int32_t row = 0; row < rows; ++row) {
+        unsigned char* out = destination + static_cast<std::size_t>(row) * bank_pitch;
+        std::memcpy(out, source + static_cast<std::size_t>(row) * stored_pitch, stored_pitch);
+        std::memset(out + stored_pitch, 0, bank_pitch - stored_pitch);
+    }
+}
+
+} // namespace
+
+bool LoraInventory::any() const noexcept {
+    for (const LoraFullLayerInventory& full : full_layers) {
+        if (full.query_gate || full.key || full.value || full.output || full.down) { return true; }
+    }
+    for (const LoraGdnLayerInventory& gdn : gdn_layers) {
+        if (gdn.output || gdn.down) { return true; }
+    }
+    return false;
+}
+
+void LoraInventory::merge(const LoraInventory& other) noexcept {
+    for (std::size_t index = 0; index < full_layers.size(); ++index) {
+        LoraFullLayerInventory& into      = full_layers[index];
+        const LoraFullLayerInventory& add = other.full_layers[index];
+        into.query_gate                   = into.query_gate || add.query_gate;
+        into.key                          = into.key || add.key;
+        into.value                        = into.value || add.value;
+        into.output                       = into.output || add.output;
+        into.down                         = into.down || add.down;
+    }
+    for (std::size_t index = 0; index < gdn_layers.size(); ++index) {
+        LoraGdnLayerInventory& into      = gdn_layers[index];
+        const LoraGdnLayerInventory& add = other.gdn_layers[index];
+        into.output                      = into.output || add.output;
+        into.down                        = into.down || add.down;
+    }
+}
+
+std::size_t LoraInventory::site_count() const noexcept {
+    std::size_t count = 0;
+    for (const LoraFullLayerInventory& full : full_layers) {
+        count += (full.query_gate ? 2U : 0U) + (full.key ? 1U : 0U) + (full.value ? 1U : 0U) +
+                 (full.output ? 1U : 0U) + (full.down ? 1U : 0U);
+    }
+    for (const LoraGdnLayerInventory& gdn : gdn_layers) {
+        count += (gdn.output ? 1U : 0U) + (gdn.down ? 1U : 0U);
+    }
+    return count;
+}
+
+namespace {
+
+LoraBankProfile build_bank_profile(const LoraInventory& inventory, std::int32_t rank) {
+    LoraBankProfile profile;
+    profile.rank      = rank;
+    profile.inventory = inventory;
+
+    SlabBuilder slab;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        if (is_full_attention_layer(layer)) {
+            const std::size_t index            = full_attention_index(layer);
+            const LoraFullLayerInventory& have = inventory.full_layers[index];
+            LoraFullLayerPlan& plan            = profile.full_layers[index];
+            if (have.query_gate) {
+                plan.query = place_site(slab, query_site(layer), rank);
+                plan.gate  = place_site(slab, gate_site(layer), rank);
+            }
+            if (have.key) { plan.key = place_site(slab, key_site(layer), rank); }
+            if (have.value) { plan.value = place_site(slab, value_site(layer), rank); }
+            if (have.output) {
+                plan.output = place_site(slab, attention_output_site(layer), rank);
+            }
+            if (have.down) { plan.down = place_site(slab, mlp_down_site(layer), rank); }
+        } else {
+            const std::size_t index           = gdn_index(layer);
+            const LoraGdnLayerInventory& have = inventory.gdn_layers[index];
+            LoraGdnLayerPlan& plan            = profile.gdn_layers[index];
+            if (have.output) { plan.output = place_site(slab, gdn_output_site(layer), rank); }
+            if (have.down) { plan.down = place_site(slab, mlp_down_site(layer), rank); }
+        }
+    }
+    profile.slab_bytes = align_up(slab.bytes(), kSlabAlignment);
+    return profile;
+}
+
+} // namespace
+
+LoraDiscovery discover_lora_pool(const LoraOptions& options,
+                                 const artifact::FingerprintCacheOptions& fingerprint_cache) {
+    LoraDiscovery discovery;
+    discovery.fingerprint_cache = fingerprint_cache;
+    if (options.directory.empty()) { return discovery; }
+
+    std::error_code error;
+    if (!std::filesystem::is_directory(options.directory, error)) {
+        throw std::invalid_argument("LoRA adapter directory '" + options.directory.string() +
+                                    "' is not a directory");
+    }
+    if (options.rank_ceiling != 0 && !registered_rank(options.rank_ceiling)) {
+        throw std::invalid_argument("LoRA rank ceiling " + std::to_string(options.rank_ceiling) +
+                                    " is not registered; supported ranks are 8, 16, 32, 64");
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(options.directory)) {
+        if (!entry.is_regular_file()) { continue; }
+        if (entry.path().extension() != ".ninfer") { continue; }
+        candidates.push_back(entry.path());
+    }
+    // Pool order is the sorted file name, so a pool index is reproducible across processes even
+    // though nothing persisted depends on it.
+    std::sort(candidates.begin(), candidates.end());
 
     std::set<std::string> seen;
-    std::vector<LoraArtifactLoadPlan> plans;
-    std::vector<artifact::MaterializedArtifact> materialized;
-    plans.reserve(adapters.size());
-    materialized.reserve(adapters.size());
-
-    for (const LoraAdapterSpec& spec : adapters) {
-        if (spec.name.empty()) {
-            throw std::invalid_argument("a registered LoRA adapter must have a name");
-        }
-        if (!seen.insert(spec.name).second) {
-            throw std::invalid_argument("LoRA adapter name '" + spec.name +
-                                        "' is registered more than once");
-        }
-        artifact::Reader reader(spec.path);
-        const artifact::ArtifactIdentity& identity = reader.identity();
-        if (identity.model_id != std::string(Package::model_id) ||
-            identity.weights_id != std::string(kLoraWeightsId)) {
-            throw std::invalid_argument(
-                "LoRA adapter '" + spec.name + "' has identity '" + identity.model_id + "/" +
-                identity.weights_id + "', but this engine requires '" +
-                std::string(Package::model_id) + "/" + std::string(kLoraWeightsId) + "'");
-        }
-        artifact::Binder binder(reader);
-        LoraArtifactLoadPlan plan = bind_lora_artifact(binder, reader);
-        if (!plans.empty()) {
-            if (plan.bindings.rank != plans.front().bindings.rank) {
-                throw std::invalid_argument(
-                    "LoRA adapter '" + spec.name + "' has rank " +
-                    std::to_string(plan.bindings.rank) + ", but adapter '" + bank.names.front() +
-                    "' has rank " + std::to_string(plans.front().bindings.rank) +
-                    "; every registered adapter must share one rank");
+    std::int32_t bank_rank = 0;
+    LoraInventory united;
+    for (const std::filesystem::path& path : candidates) {
+        const std::string name = pool_name(path);
+        try {
+            if (name.empty()) { throw artifact::ArtifactError("empty adapter name"); }
+            artifact::Reader reader(path, fingerprint_cache, artifact::FingerprintProgress{});
+            const artifact::ArtifactIdentity& identity = reader.identity();
+            if (identity.model_id != std::string(Package::model_id) ||
+                identity.weights_id != std::string(kLoraWeightsId)) {
+                throw artifact::ArtifactError("identity is '" + identity.model_id + "/" +
+                                              identity.weights_id + "', not '" +
+                                              std::string(Package::model_id) + "/" +
+                                              std::string(kLoraWeightsId) + "'");
             }
-            if (plan.bindings.slab_bytes != plans.front().bindings.slab_bytes ||
-                plan.bindings.objects.size() != plans.front().bindings.objects.size()) {
-                throw std::invalid_argument(
-                    "LoRA adapter '" + spec.name +
-                    "' targets a different site set than adapter '" + bank.names.front() +
-                    "'; every registered adapter must share one inventory");
+            LoraPoolEntry entry;
+            entry.name = name;
+            entry.path = path;
+            read_inventory(reader, entry.inventory, entry.rank);
+            if (!entry.inventory.any()) {
+                throw artifact::ArtifactError("carries no registered site, so it corrects nothing");
             }
+            if (!registered_rank(entry.rank)) {
+                throw artifact::ArtifactError("rank " + std::to_string(entry.rank) +
+                                              " is not registered; supported ranks are 8, 16, 32,"
+                                              " 64");
+            }
+            if (options.rank_ceiling != 0 && entry.rank > options.rank_ceiling) {
+                throw artifact::ArtifactError("rank " + std::to_string(entry.rank) +
+                                              " exceeds the configured ceiling " +
+                                              std::to_string(options.rank_ceiling));
+            }
+            if (!seen.insert(entry.name).second) {
+                throw artifact::ArtifactError("adapter name '" + entry.name +
+                                              "' is already in the pool");
+            }
+            entry.file_bytes  = reader.file_bytes();
+            entry.fingerprint = reader.content_fingerprint();
+            bank_rank         = std::max(bank_rank, entry.rank);
+            united.merge(entry.inventory);
+            discovery.pool.push_back(std::move(entry));
+        } catch (const std::exception& failure) {
+            discovery.rejected.push_back(path.filename().string() + ": " + failure.what());
         }
-        bank.file_bytes += reader.file_bytes();
-        materialized.push_back(artifact::materialize(reader, plan.materialization, device));
-        plans.push_back(std::move(plan));
-        bank.names.push_back(spec.name);
     }
 
-    const LoraBindingPlan& reference = plans.front().bindings;
-    const std::uint64_t slab         = reference.slab_bytes;
-    bank.device_bytes                = slab * adapters.size();
-    bank.arena = std::make_unique<DeviceArena>(
-        static_cast<std::size_t>(bank.device_bytes) + kSlabAlignment);
+    if (!discovery.rejected.empty()) {
+        std::string detail;
+        for (const std::string& reason : discovery.rejected) {
+            detail += detail.empty() ? "" : "; ";
+            detail += reason;
+        }
+        throw std::invalid_argument("LoRA adapter directory '" + options.directory.string() +
+                                    "' contains an unusable adapter: " + detail);
+    }
+    if (discovery.pool.empty()) {
+        throw std::invalid_argument("LoRA adapter directory '" + options.directory.string() +
+                                    "' holds no '.ninfer' adapter");
+    }
+
+    discovery.profile = build_bank_profile(united, bank_rank);
+    return discovery;
+}
+
+LoraBank::LoraBank(LoraDiscovery discovery, std::uint32_t slots, DeviceContext& device)
+    : pool_(std::move(discovery.pool)), profile_(std::move(discovery.profile)),
+      fingerprint_cache_(std::move(discovery.fingerprint_cache)) {
+    if (pool_.empty()) { throw std::invalid_argument("a LoRA bank needs at least one adapter"); }
+    if (slots == 0) { throw std::invalid_argument("a LoRA bank needs at least one slot"); }
+    // Committing more slots than the pool can fill would reserve device memory the engine can
+    // never use, and the KV resolver would silently shrink the context to pay for it.
+    slots_ = static_cast<std::uint32_t>(std::min<std::size_t>(slots, pool_.size()));
+
+    for (const LoraPoolEntry& entry : pool_) { pool_file_bytes_ += entry.file_bytes; }
+
+    const std::uint64_t slab = profile_.slab_bytes;
+    device_bytes_            = slab * slots_;
+    arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(device_bytes_) +
+                                           kSlabAlignment);
     const DeviceSpan storage =
-        bank.arena->alloc_bytes(static_cast<std::size_t>(bank.device_bytes), kSlabAlignment);
-    auto* base = static_cast<unsigned char*>(storage.data);
+        arena_->alloc_bytes(static_cast<std::size_t>(device_bytes_), kSlabAlignment);
+    base_ = static_cast<unsigned char*>(storage.data);
+    // A slot the engine has not staged yet must read as an exact no-op rather than as whatever
+    // the allocator handed back, because the captured graph reads every slot's geometry
+    // unconditionally and only the per-row index decides which one contributes.
+    CUDA_CHECK(cudaMemsetAsync(base_, 0, static_cast<std::size_t>(device_bytes_), device.stream));
 
-    // Pack adapter-major so every site's adapter stride is one constant.
-    for (std::size_t index = 0; index < plans.size(); ++index) {
-        unsigned char* destination = base + static_cast<std::uint64_t>(index) * slab;
-        for (const LoraObjectPlacement& placement : plans[index].bindings.objects) {
-            CUDA_CHECK(cudaMemcpyAsync(destination + placement.offset,
-                                       materialized[index].device_data(placement.object),
-                                       static_cast<std::size_t>(placement.bytes),
-                                       cudaMemcpyDeviceToDevice, device.stream));
-        }
-    }
-    device.synchronize();
+    staging_.emplace(static_cast<std::size_t>(slab));
 
-    bank.view.adapters = static_cast<std::uint32_t>(plans.size());
-    bank.view.rank     = reference.rank;
+    view_.slots        = slots_;
+    view_.pool_size    = static_cast<std::uint32_t>(pool_.size());
+    view_.rank         = profile_.rank;
+    view_.device_bytes = device_bytes_;
+    view_.pool         = this;
+    view_.fingerprints.reserve(pool_.size());
+    for (const LoraPoolEntry& entry : pool_) { view_.fingerprints.push_back(entry.fingerprint); }
     for (std::size_t index = 0; index < kFullAttentionLayers; ++index) {
-        const LoraFullLayerPlan& source     = reference.full_layers[index];
-        qwen3_8::LoraFullLayerWeights& view = bank.view.full_layers[index];
-        view.query  = bind_site_view(source.query, base, slab, reference.rank, kHidden);
-        view.gate   = bind_site_view(source.gate, base, slab, reference.rank, kHidden);
-        view.key    = bind_site_view(source.key, base, slab, reference.rank, kHidden);
-        view.value  = bind_site_view(source.value, base, slab, reference.rank, kHidden);
-        view.output = bind_site_view(source.output, base, slab, reference.rank, kAttentionValues);
-        view.down   = bind_site_view(source.down, base, slab, reference.rank, kIntermediate);
+        const LoraFullLayerPlan& source     = profile_.full_layers[index];
+        qwen3_8::LoraFullLayerWeights& view = view_.full_layers[index];
+        view.query  = bind_site_view(source.query, base_, slab, profile_.rank);
+        view.gate   = bind_site_view(source.gate, base_, slab, profile_.rank);
+        view.key    = bind_site_view(source.key, base_, slab, profile_.rank);
+        view.value  = bind_site_view(source.value, base_, slab, profile_.rank);
+        view.output = bind_site_view(source.output, base_, slab, profile_.rank);
+        view.down   = bind_site_view(source.down, base_, slab, profile_.rank);
     }
     for (std::size_t index = 0; index < kGdnLayers; ++index) {
-        const LoraGdnLayerPlan& source     = reference.gdn_layers[index];
-        qwen3_8::LoraGdnLayerWeights& view = bank.view.gdn_layers[index];
-        view.output = bind_site_view(source.output, base, slab, reference.rank, kGdnValues);
-        view.down   = bind_site_view(source.down, base, slab, reference.rank, kIntermediate);
+        const LoraGdnLayerPlan& source     = profile_.gdn_layers[index];
+        qwen3_8::LoraGdnLayerWeights& view = view_.gdn_layers[index];
+        view.output = bind_site_view(source.output, base_, slab, profile_.rank);
+        view.down   = bind_site_view(source.down, base_, slab, profile_.rank);
     }
-    return bank;
+    device.synchronize();
+}
+
+// Fills the pinned slab with one adapter at the bank profile. Every profile byte is written
+// exactly once - either from the artifact or as zero - so no residue of the slot's previous
+// occupant can survive into the upload.
+void LoraBank::assemble(const LoraPoolEntry& entry, const artifact::Reader& reader) {
+    auto* slab = static_cast<unsigned char*>(staging_->data());
+    std::memset(slab, 0, staging_->size());
+
+    const auto copy_site = [&](const LoraSitePlan& plan, const SiteNames& names, bool have) {
+        if (!plan.present || !have) { return; }
+        const artifact::PayloadSpan a = reader.payload(names.a);
+        const artifact::PayloadSpan b = reader.payload(names.b);
+        stage_a_factor(slab + plan.a_offset, a.data.data(), entry.rank, profile_.rank,
+                       plan.columns);
+        stage_b_factor(slab + plan.b_offset, b.data.data(), entry.rank, profile_.rank, plan.rows);
+    };
+
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        if (is_full_attention_layer(layer)) {
+            const std::size_t index            = full_attention_index(layer);
+            const LoraFullLayerPlan& plan      = profile_.full_layers[index];
+            const LoraFullLayerInventory& have = entry.inventory.full_layers[index];
+            // Query and gate share one down-projection factor; staging it twice is harmless and
+            // keeps the walk uniform.
+            copy_site(plan.query, query_site(layer), have.query_gate);
+            copy_site(plan.gate, gate_site(layer), have.query_gate);
+            copy_site(plan.key, key_site(layer), have.key);
+            copy_site(plan.value, value_site(layer), have.value);
+            copy_site(plan.output, attention_output_site(layer), have.output);
+            copy_site(plan.down, mlp_down_site(layer), have.down);
+        } else {
+            const std::size_t index           = gdn_index(layer);
+            const LoraGdnLayerPlan& plan      = profile_.gdn_layers[index];
+            const LoraGdnLayerInventory& have = entry.inventory.gdn_layers[index];
+            copy_site(plan.output, gdn_output_site(layer), have.output);
+            copy_site(plan.down, mlp_down_site(layer), have.down);
+        }
+    }
+}
+
+void LoraBank::prepare(std::size_t index) {
+    if (index >= pool_.size()) { throw std::invalid_argument("LoRA adapter is outside the pool"); }
+    prepared_index_.reset();
+    prepare_started_ = std::chrono::steady_clock::now();
+
+    // Reopen through the existing fingerprint cache and verify content identity before copying.
+    // A long-lived mmap is not an immutable snapshot: same-inode writes can alter its pages, which
+    // would make executed bytes disagree with the fingerprint used by continuation state.
+    const LoraPoolEntry& entry = pool_[index];
+    artifact::Reader reader(entry.path, fingerprint_cache_, artifact::FingerprintProgress{});
+    if (reader.content_fingerprint() != entry.fingerprint) {
+        throw std::runtime_error("LoRA adapter '" + entry.name +
+                                 "' changed on disk after discovery");
+    }
+    assemble(entry, reader);
+    prepared_index_ = index;
+}
+
+void LoraBank::commit(std::uint32_t slot, DeviceContext& device) {
+    if (slot >= slots_) { throw std::invalid_argument("LoRA slot is outside the bank"); }
+    if (!prepared_index_) { throw std::logic_error("no LoRA adapter is prepared for staging"); }
+    CUDA_CHECK(cudaMemcpyAsync(base_ + static_cast<std::uint64_t>(slot) * profile_.slab_bytes,
+                               staging_->data(), static_cast<std::size_t>(profile_.slab_bytes),
+                               cudaMemcpyHostToDevice, device.stream));
+    device.synchronize();
+
+    prepared_index_.reset();
+    ++stage_count_;
+    stage_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                     prepare_started_).count();
+}
+
+void LoraBank::stage(std::uint32_t slot, std::size_t index, DeviceContext& device) {
+    prepare(index);
+    commit(slot, device);
 }
 
 } // namespace ninfer::targets::qwen3_8_27b::detail

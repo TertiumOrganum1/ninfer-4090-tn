@@ -104,24 +104,38 @@ struct ContinuationCacheOptions {
     std::uint32_t prefix_checkpoint_history = 4;
 };
 
-// Startup-registered LoRA adapter. Registration is explicit: an adapter exists only because it
-// was named on the command line or in EngineOptions. There is no directory discovery.
-inline constexpr std::size_t kMaximumLoraAdapters = 8;
-
-struct LoraAdapterSpec {
-    std::string name;
-    std::filesystem::path path;
+// LoRA adapter pool. Every conforming `.ninfer` adapter under `directory` is discovered at
+// startup and selectable by name for the process lifetime; the pool size is unbounded. Only
+// `slots` of them are device-resident at once, and the engine swaps an adapter into a slot at
+// admission when a request selects one that is not resident.
+//
+// Discovery validates every descriptor and computes the adapter's SHA-256 content fingerprint,
+// which namespaces its continuation state. The configured artifact sidecar cache avoids rescans
+// for unchanged files.
+struct LoraOptions {
+    // Empty disables LoRA entirely: no bank is committed and the captured graph is topologically
+    // identical to a build without adapter support.
+    std::filesystem::path directory;
+    // Resident device slots. Bounded only by device memory, which the KV capacity resolver sees
+    // after the bank is committed. A pool smaller than this commits only what it needs.
+    std::uint32_t slots = 2;
+    // Bank rank ceiling. Zero takes the maximum rank present in the pool. An adapter above the
+    // ceiling is rejected at discovery rather than silently taxing every other adapter.
+    std::int32_t rank_ceiling = 0;
 };
 
-// What a target package committed when it attached the registered adapters. Returned by
-// `Package::attach_lora` so the loader publishes the resident bank's cost once, at the point
-// that knows it, instead of discarding it and leaving the bytes unattributable later.
+// What a target package committed when it attached the adapter pool. Returned by
+// `Package::attach_lora` so the loader publishes the pool and the resident bank's cost once, at
+// the point that knows it, instead of discarding it and leaving the bytes unattributable later.
 struct LoraAttachment {
-    // Adapter names in bank-index order; empty when no adapter was registered.
+    // Discovered adapter names in pool order; empty when no adapter was discovered.
     std::vector<std::string> names;
-    // Shared rank of every adapter in the bank.
+    // Bank rank. Every pool adapter executes at this rank; a lower-rank adapter is zero-padded
+    // into it, which is exact because the padded factors contribute nothing.
     std::int32_t rank = 0;
-    // Device bytes committed for the bank, and artifact bytes read to fill it.
+    // Device-resident slots the bank committed.
+    std::uint32_t slots = 0;
+    // Device bytes committed for the bank, and artifact bytes the pool occupies on disk.
     std::uint64_t device_bytes = 0;
     std::uint64_t file_bytes   = 0;
 };
@@ -171,8 +185,7 @@ struct EngineOptions {
     std::uint32_t vision_max_tokens = 8192;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
-    // At most kMaximumLoraAdapters entries, each with a unique name.
-    std::vector<LoraAdapterSpec> lora_adapters;
+    LoraOptions lora;
     LoadProgress load_progress;
 };
 
@@ -246,8 +259,9 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     // Client-provided routing hint only; exact prepared-prefix identity must authorize reuse.
     std::optional<std::string> routing_hint;
-    // Registered adapter name; nullopt selects the base weights. An unregistered name is a
-    // request error, never a silent fallback to base.
+    // Pool adapter name; nullopt selects the base weights. A name outside the pool is a request
+    // error, never a silent fallback to base. Residency is invisible here: a name in the pool is
+    // always selectable, and the engine stages it into a slot if it is not resident.
     std::optional<std::string> adapter;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
@@ -839,6 +853,9 @@ struct LoadSummary {
     std::string target;
     std::string model_id;
     std::string weights_id;
+    // Complete base-artifact identity. Session images bind to this rather than only to the
+    // registered model/weights strings, which are not unique to one set of weight bytes.
+    std::array<std::uint8_t, 32> artifact_fingerprint{};
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;
@@ -846,11 +863,13 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
-    // Registered adapter names in bank-index order; empty when no adapter was registered.
+    // Discovered adapter names in pool order; empty when no adapter was discovered. Every name
+    // here is selectable by a request regardless of what is currently resident.
     std::vector<std::string> lora_adapter_names;
-    // Shared rank of the resident bank, and the device and file bytes it cost. Every registered
-    // adapter carries the same rank by construction, so one value describes the bank.
+    // Bank rank, resident slot count, the device bytes the bank cost, and the disk bytes the
+    // whole pool occupies. A lower-rank pool adapter is zero-padded into the bank rank.
     std::int32_t lora_rank             = 0;
+    std::uint32_t lora_slots           = 0;
     std::uint64_t lora_device_bytes    = 0;
     std::uint64_t lora_file_bytes      = 0;
 };

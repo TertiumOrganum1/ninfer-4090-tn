@@ -211,20 +211,19 @@ converts into several banked adapters at different strengths, with **no code cha
 | Served name | `lora_alpha` | Folded scale | Relative to trained |
 |---|---:|---:|---:|
 | base | — | — | 0× |
-| `qwen3.8-27b-pirate-x05` | 32 | 1.0 | 0.5× |
-| `qwen3.8-27b-pirate-x1` | 64 | 2.0 | 1.0× |
-| `qwen3.8-27b-pirate-x15` | 96 | 3.0 | 1.5× |
-| `qwen3.8-27b-pirate-x2` | 128 | 4.0 | 2.0× |
+| `qwen3.8-27b-pirate-a32` | 32 | 1.0 | 0.5× |
+| `qwen3.8-27b-pirate-a64` | 64 | 2.0 | 1.0× |
+| `qwen3.8-27b-pirate-a96` | 96 | 3.0 | 1.5× |
+| `qwen3.8-27b-pirate-a128` | 128 | 4.0 | 2.0× |
 
-All four share rank and site inventory, so all four bank together; four of the eight
-`kMaximumLoraAdapters` slots remain free.
+All four share rank and site inventory, so the union profile is exactly one adapter's and none of
+them pays a normalization tax. Names come from the filenames, so the directory below serves
+`pirate-a32` through `pirate-a128`. Four slots keep all four resident and remove swapping from the
+sweep, which matters here because the arms are compared against each other.
 
 ```bash
 ninfer-serve models/qwen3_8_27b.ninfer \
-  --lora pirate-x05=lora/pirate-a32.lora.ninfer \
-  --lora pirate-x1=lora/pirate-a64.lora.ninfer \
-  --lora pirate-x15=lora/pirate-a96.lora.ninfer \
-  --lora pirate-x2=lora/pirate-a128.lora.ninfer \
+  --lora-dir lora/pirate --lora-slots 4 \
   --no-thinking --greedy \
   --continuation-cache off --no-prefix-reuse \
   --request-log-jsonl profiles/bench/persona.jsonl
@@ -232,7 +231,7 @@ ninfer-serve models/qwen3_8_27b.ninfer \
 
 Five scale points, one process, no reload, selected per request by model id.
 
-The delta scales linearly; behaviour will not. Expect `x2` to degrade, possibly into incoherence.
+The delta scales linearly; behaviour will not. Expect `a128` to degrade, possibly into incoherence.
 Locating that breakdown is the point of the sweep, not a failure of it.
 
 ## 10. Evaluation protocol

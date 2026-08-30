@@ -173,6 +173,21 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // Make a pool adapter device-resident, staging it over the least recently used slot that no
+    // generating lane depends on. Retained lanes holding the displaced adapter are handed to
+    // `release_retained` so the caller publishes their sessions instead of losing them. Returns
+    // false, changing nothing, when every slot is held by a generating lane using another
+    // adapter; the caller defers the request until a lane frees. The base weights are always
+    // resident. This must succeed before a request selecting the adapter is admitted, and before
+    // a saved session naming it is restored.
+    [[nodiscard]] bool
+    ensure_adapter_resident(std::int32_t adapter,
+                            const std::function<void(std::uint32_t)>& release_retained);
+    // Stable cache scope for a pool adapter: "base", or the adapter's artifact content
+    // fingerprint. Continuation state produced under one adapter is invalid under any other, and
+    // this is what keeps their aliases disjoint across swaps, pool reordering and restarts.
+    [[nodiscard]] std::string adapter_scope(std::int32_t adapter) const;
+    [[nodiscard]] std::uint64_t lora_stage_count() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,
@@ -254,9 +269,12 @@ public:
     // synchronize the device before returning and require the lane to hold no active request.
     [[nodiscard]] RetainedSessionSnapshot save_retained_lane(std::uint32_t lane,
                                                              std::string_view model_binding);
-    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
-                                                      std::span<const std::uint8_t> snapshot,
-                                                      std::string_view model_binding);
+    // `release_retained` is used only when the snapshot names a LoRA adapter that is not
+    // resident and a slot must be freed for it; see ensure_adapter_resident.
+    [[nodiscard]] std::uint32_t
+    restore_retained_lane(std::uint32_t lane, std::span<const std::uint8_t> snapshot,
+                          std::string_view model_binding,
+                          const std::function<void(std::uint32_t)>& release_retained);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

@@ -124,8 +124,8 @@ an identical history up to that point.
 ## Persistence and eviction
 
 Slot snapshots (`--slot-save-path`) carry the ring. The snapshot format is version
-3, which records the registered LoRA adapter set and the ring unconditionally - an
-empty ring is a zero count, not an absent section - so one reader shape covers
+4, which records the LoRA adapter's content fingerprint and the ring unconditionally
+- an empty ring is a zero count, not an absent section - so one reader shape covers
 every image. Earlier versions are rejected. A restore into a server with a smaller
 ring keeps the newest entries that fit.
 

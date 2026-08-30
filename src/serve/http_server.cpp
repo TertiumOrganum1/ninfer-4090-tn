@@ -769,7 +769,9 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
     }
 
     // Adapter inventory. Names come from the load summary rather than from the served model ids,
-    // so an adapter that has taken no traffic is still reported.
+    // so an adapter that has taken no traffic is still reported. `count` is the whole discovered
+    // pool and every entry is selectable; `slots` is how many are device-resident at once, which
+    // is a residency detail clients never see.
     nlohmann::json adapters = nlohmann::json::object();
     {
         nlohmann::json names = nlohmann::json::array();
@@ -782,6 +784,7 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
                     {"names", std::move(names)},
                     {"model_ids", std::move(ids)},
                     {"rank", load.lora_rank},
+                    {"slots", load.lora_slots},
                     {"device_bytes", load.lora_device_bytes},
                     {"file_bytes", load.lora_file_bytes}};
     }

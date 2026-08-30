@@ -2,32 +2,37 @@
 
 ## Status and scope
 
-Opened 2026-08-19; delivered 2026-08-20. This file **is** the current implementation map for
-runtime LoRA. Every phase in §12 has landed and is exercised end to end on the real
-`groupwise-int` artifact, from Unsloth training through conversion, banking, execution and
-per-request serving.
+Opened 2026-08-19; delivered 2026-08-20; the adapter pool replaced the fixed eight-adapter bank on
+2026-08-30. This file **is** the current implementation map for runtime LoRA. Every phase in §12 has
+landed and is exercised end to end on the real `groupwise-int` artifact, from Unsloth training
+through conversion, banking, execution and per-request serving.
 
 It remains a transitional document. Its stable contracts still owe migration into the permanent
 authorities listed at the end of this section, after which this file is deleted.
 
-Deliverable: QLoRA adapters trained externally with Unsloth, converted to `.ninfer`, loaded
-alongside the base artifact, and selected **per request by the OpenAI/Anthropic `model` string** —
-`qwen3.8-27b` runs the unmodified base, `qwen3.8-27b-qlora-math` runs the base plus the `math`
-adapter, with no reload between requests.
+Deliverable: QLoRA adapters trained externally with Unsloth, converted to `.ninfer`, discovered
+from a directory alongside the base artifact, and selected **per request by the OpenAI/Anthropic
+`model` string** — `qwen3.8-27b` runs the unmodified base, `qwen3.8-27b-qlora-math` runs the base
+plus the `math` adapter, with no reload between requests.
+
+The pool of servable adapters is unbounded and costs only host memory. Device residency is a
+separate, bounded resource: `--lora-slots` slabs are allocated at load and an adapter is swapped
+into one at admission, LRU by last use, so a pool of a hundred adapters serves from two slots.
 
 In scope:
 
 - the adapter `.ninfer` contract and its converter;
 - one new Op family that applies a low-rank correction with per-token adapter routing;
-- resident multi-adapter banking, request routing, and prefix-reuse isolation;
+- directory discovery, bounded slot residency with admission-time swapping, request routing, and
+  prefix-reuse isolation;
 - serving-side model-name routing and `/v1/models`;
 - a synthetic-adapter bring-up ladder that validates all of the above **before** any checkpoint
   download or training run;
 - the Unsloth training recipe and its constraints on this target.
 
 Out of scope: adapters for `qwen3.6-35b-a3b`, adapter training inside NInfer, adapter merging into
-base weights, runtime adapter add/remove after startup, and rank or target-module sets outside the
-registered contract.
+base weights, rescanning the directory after startup, and target-module sets outside the registered
+contract. The pool is enumerated once at load; adding a file later requires a restart.
 
 Pending migration: the adapter inventory belongs in `qwen3.8-27b-artifact.md`, the Op contract in
 `op-development.md`, routing and prefix keying in `concurrent-inference-architecture.md`, and the
@@ -44,14 +49,23 @@ string-driven execution, or runtime allocation.
 
 Changes required in `AGENTS.md` when the work lands:
 
-- "Current product contract" gains: the 27B target additionally accepts zero to eight registered
-  LoRA adapter artifacts, fixed at startup, selected per request by name.
+- "Current product contract" gains: the 27B target additionally accepts a directory of LoRA
+  adapter artifacts, enumerated at startup and selected per request by name, of which a
+  startup-fixed number are device-resident at a time.
 - "Product and ownership boundaries" gains: `tools/convert/qwen3_8_27b` owns adapter conversion;
   `src/ops/lora` owns the low-rank correction Op; the adapter bank is package-owned persistent
   state; serving owns the model-name route table.
 
-Adapter registration is **explicit** (`--lora NAME=PATH`, repeatable). Directory scanning or
-name-pattern discovery is not admitted.
+Adapter registration is **the directory**: `--lora-dir PATH` enumerates every `*.ninfer` in it,
+sorted by filename, and the adapter's name is its filename stem with a trailing `.lora` removed, so
+`math7.lora.ninfer` serves as `math7`. There is no per-adapter flag and no name-pattern matching.
+
+This is a discovery mechanism, which the "no plugin discovery" rule in `AGENTS.md` would otherwise
+exclude, so the distinction matters. The rule bars discovering *code paths* — execution is still
+fully determined by the compiled Variant and the registered base identity. What the directory
+enumerates is *weights in a registered format*: every entry is validated at load against the same
+inventory, shape and identity contract a `--lora`-named file was, and a file that fails it aborts
+the load. The directory changes how the set is named, not what may enter it.
 
 ## 2. Feasibility findings
 
@@ -252,8 +266,11 @@ adapter never carries those six files, so a trainer's re-serialization of `token
 break adapter conversion.
 
 `model_id` is the **base** model id, not the served name. It is the load-time compatibility check.
-The served name comes from `--lora NAME=PATH`, which is deployment configuration, not artifact
-identity — the same precedent as `--model-id` (`src/serve/serve_options.cpp:203-207`).
+The served name comes from the artifact's **filename** within `--lora-dir` — its stem with a
+trailing `.lora` removed, so `math7.lora.ninfer` serves as `math7`. Naming is deployment
+configuration, not artifact identity: renaming the file renames the served model and changes
+nothing else, because everything that must survive a rename — continuation scoping and snapshot
+identity — keys on the artifact's SHA-256 instead (§6.6).
 
 ### 4.2 Object names
 
@@ -393,30 +410,46 @@ Three existing mechanisms carry the whole design:
 2. **The H2D upload is inside the captured graph.** `decode_impl.h:20-22` copies the whole
    `OrdinaryDecodeIngress` from a fixed pinned host address every replay. Adding a field changes
    the struct, not the topology.
-3. **Adapter count is startup-fixed**, so bank base pointers and strides are kernel constants and
-   the bank lives in the persistent arena, which is one `cudaMalloc` with deterministic offsets
+3. **Slot count is startup-fixed**, so bank base pointers and strides are kernel constants and the
+   bank lives in the persistent arena, which is one `cudaMalloc` with deterministic offsets
    (`src/core/arena.cu:189-214`).
+
+Swapping an adapter into a slot does not disturb any of this, and the reason is worth stating
+precisely. Capture freezes four things: the bank base pointer, the slab stride, the site geometry,
+and the rank — the last because it is a host-side template switch at
+`src/ops/launcher/lora_delta.cu:82-89`. A swap changes none of them; it overwrites the *bytes* at a
+fixed device address between rounds, which a captured graph cannot observe. The one thing that does
+vary per replay, `adapters[B]`, is a device-resident runtime value already re-uploaded every replay
+by mechanism 2 above.
+
+That is also why the pool is unbounded while the slots are not. The frozen quantities all scale with
+the *slot* count; nothing in the captured graph scales with how many adapters exist on disk.
 
 **Maximal batched decode is preserved.** Mixed-adapter batches execute in one round; there is no
 cohorting by adapter, so the §2.1 invariant in `concurrent-inference-architecture.md:60-63` is not
 weakened.
 
-**Zero cost when unused.** With no `--lora`, `StartupFeatures::lora_adapters == 0`, the LoRA leaves
+**Zero cost when unused.** With no `--lora-dir`, `StartupFeatures::lora_slots == 0`, the LoRA leaves
 are not emitted, and the captured graph is topologically identical to today. Base-model throughput
 is provably unchanged.
+
+`startup_features()` reads the **requested** slot count, not the count the bank ended up with. A
+pool smaller than `--lora-slots` clamps the allocation, but the frozen feature set must depend only
+on `EngineOptions`, or the features computed before load would not match the features after it.
 
 ### 6.2 Family runtime — `src/targets/qwen3_8/`
 
 | File:line | Change |
 |---|---|
-| `export/ninfer/targets/qwen3_8/startup_features.h:7-26` | `+ std::uint32_t lora_adapters = 0;` and `bool lora() const noexcept`; populate in `startup_features(options)` at `:28-35` |
+| `export/ninfer/targets/qwen3_8/startup_features.h:7-26` | `+ std::uint32_t lora_slots = 0;` and `bool lora() const noexcept`; populate in `startup_features(options)` at `:28-35` |
 | `export/ninfer/targets/qwen3_8/round_state.h:31-38` | `+ std::array<std::int32_t, kMaximumConcurrency> adapters{};` in `OrdinaryDecodeIngress`; same in `MtpDecodeIngress` (`:46`) and `DFlashDecodeIngress` (`:72`) |
 | `impl/state/round_state.cpp:81-110` | `+ adapters = ingress_tensor(offsetof(OrdinaryDecodeIngress, adapters), DType::I32);` |
 | `impl/runtime/text_context.h:75-97` | `+ LoraSiteViews` on `FullLayerW`, `GdnLayerW`, `MlpW`; bind at `text_context_impl.h:262-318` |
 | `impl/runtime/text_context_impl.h:811`, `:850`, `:955`, `:964` | insert `Variant::lora_*` calls guarded by `features.lora()` |
 | `impl/runtime/layouts_impl.h` `attention_stage`/`gdn_stage`/`post_mixer_stage` | `+ scratch(layout, ...)` for the LoRA groups. The layout is frozen before any adapter artifact is read, so it is sized for `StartupFeatures::lora_sizing_rank`, which is `kMaximumLoraRank` whenever adapters are registered. The bank's executed rank lives on the model view. The difference is well under a MiB of transient scratch. The bank itself is not a `PersistentLayout` region: it is its own `DeviceArena` owned by `LoadedModelData`, committed before KV capacity is resolved so the authoritative resolver already excludes it |
 | `impl/runtime/workspace_recipe.h` | `+ lora_intermediate<Config>(alloc, rank, site_count, T)`, mirrored into `layouts_impl.h` `attention_stage` / `gdn_stage` / `post_mixer_stage` (`:258-308`) so `WorkspaceLayoutBuilder` sizes it |
-| `impl/runtime/program_impl.h:2640-2667` | fill `ordinary_host_ingress->adapters[row]` beside `lanes[row]` |
+| `impl/runtime/program_impl.h:2640-2667` | fill `ordinary_host_ingress->adapters[row]` beside `lanes[row]`, translating the lane's pool index through `lora_slot()`; the same translation at the MTP and DFlash ingress and at `PrefillContext::adapter` |
+| `impl/runtime/program_impl.h` residency policy | `lora_slot`, `lora_slot_pinned`, `ensure_adapter_resident`, `adapter_scope`, and the slot table (§6.8) |
 
 No new graph profiles. `ordinary_graph_profiles` (`variant.cpp:108-146`) and `topology_class` are
 untouched.
@@ -449,40 +482,72 @@ runtime branch. Because `Variant` is a concrete typedef inside each instantiatio
 template parameter, the family routes the call through a `post_mixer_with_lora<V>` helper so the
 discarded branch is genuinely dependent and never name-looked-up.
 
-Adapter binding and bank residency live in `impl/load/lora_bindings.{h,cpp}`:
-`bind_lora_artifact` discovers the rank from the first registered factor, binds the complete
-inventory with exact shapes, and assigns each object a byte offset inside one adapter slab;
-`load_lora_bank` validates identity, rank and inventory agreement across adapters, materializes
-each one, and packs them **adapter-major** into a single `DeviceArena`. Every site's adapter
-stride is then the same constant — the slab size — and every plane address is deterministic.
-`Package::attach_lora` moves that bank into `LoadedModelData` and publishes the names.
+Adapter binding, pool discovery and slot residency live in `impl/load/lora_bindings.{h,cpp}`.
+`discover_lora_pool` enumerates the directory, opens each artifact once, validates its identity and
+records its inventory, rank, and SHA-256 content fingerprint. Discovery also rejects every object
+outside the registered site table rather than accepting a partially understood adapter.
+
+`LoraBank` then derives one **union profile** over the pool — the union of every adapter's sites at
+the maximum of every adapter's rank — and allocates `slots` identical slabs of it in a single
+`DeviceArena`. Every site's slot stride is the same constant, and every plane address is
+deterministic and fixed for the process. `LoraBank::stage(slot, index)` assembles one slab in pinned
+host memory and uploads it in one contiguous transfer. It reopens the artifact and verifies its
+fingerprint before every stage: a long-lived read-only mmap is not an immutable snapshot because a
+same-inode write can change the pages underneath it. The reader uses the configured fingerprint
+sidecar cache, so unchanged files avoid rehashing when that cache is enabled.
+
+Normalizing to the union is what lets a heterogeneous directory share one captured graph, and it is
+not free: an adapter that omits `gdn/output` still executes the GDN correction against zeros,
+costing the 1.2–1.6 % measured in §8.1. Charging every adapter for the widest one is the price of
+not having a graph topology per adapter. Padding is exact — a missing site and a rank tail are
+memset to zero, so a narrow adapter computes the same delta it would in a bank of its own, which
+`ninfer_qwen3_8_27b_lora_pool_test` checks by reading the staged slab back and comparing it against
+the artifact's bytes.
+
+`Package::attach_lora` moves the bank into `LoadedModelData` and publishes the pool's names,
+fingerprints, and the real slot count.
 
 ### 6.4 Multi-artifact load — `src/targets/registry.cpp:82-134`
 
 `construct_registered` calls `Target::attach_lora` between `construct_loaded_model` and the
 authoritative `resolve_kv_capacity`. Because that resolution reads `current_free_device_bytes()`,
 the committed bank is accounted for without a separate preflight term; the earlier preflight call
-is a discarded sanity check on the base weights only. A foreign identity, a disagreeing rank or
-inventory, a duplicate name, and more than `kMaximumLoraAdapters` entries all throw at load with
-both identities or names in the message.
+is a discarded sanity check on the base weights only. A missing or empty directory, a foreign
+identity, a malformed inventory, and a duplicate name all throw at load with the offending path or
+name in the message.
+
+Two former load errors are gone. Pool size is unbounded, so there is no count to exceed; and a rank
+disagreement is now absorbed by the union profile rather than rejected. A slot count above the pool
+size is clamped rather than refused, because the excess would be an allocation no request could ever
+use.
 
 ### 6.5 Public API — `include/ninfer/types.h`
 
 ```cpp
-struct LoraAdapterSpec {                        // new
-    std::string name;
-    std::filesystem::path path;
+struct LoraOptions {                            // new
+    std::filesystem::path directory;            // empty => LoRA disabled entirely
+    std::uint32_t slots       = 2;              // device-resident adapters
+    std::int32_t rank_ceiling = 0;              // 0 => the pool's maximum rank
 };
 
-// EngineOptions, types.h:107-124
-std::vector<LoraAdapterSpec> lora_adapters;     // at most kMaximumLoraAdapters (8)
+// EngineOptions
+LoraOptions lora;
 
-// ExecutionOptions, types.h:192-198
+// ExecutionOptions
 std::optional<std::string> adapter;             // nullopt => base weights only
 
-// LoadSummary, types.h:619-630
-std::vector<std::string> lora_adapter_names;
+// LoadSummary
+std::vector<std::string> lora_adapter_names;    // pool order; unbounded
+std::uint32_t lora_slots;                       // resident slots the bank committed
 ```
+
+`kMaximumLoraAdapters` and `LoraAdapterSpec` are gone. Nothing in the public surface bounds the pool
+any more; `slots` bounds the only thing that is actually scarce.
+
+The default of two slots is deliberate. One slot is correct but serializes any request whose adapter
+differs from the running one, which for a mixed workload is worse than the swap it avoids. Setting
+`--lora-slots` equal to `--max-concurrency` removes admission stalls entirely at the cost of one
+slab per lane.
 
 `resolve_request_options` (`src/runtime/engine/engine.cpp:24-35`) resolves the name to an index;
 an unregistered name raises `RequestError`. The index is carried on
@@ -494,25 +559,42 @@ an unregistered name raises `RequestError`. The index is carried on
 KV and GDN recurrent state produced under adapter A are **invalid** for adapter B. This is a
 correctness requirement, not an optimization. Three mechanisms enforce it:
 
-- `SequenceState::adapter` records which bank index produced a lane's continuation.
+- `SequenceState::adapter` records which **pool index** produced a lane's continuation. Pool index
+  and slot index are distinct and must not be confused: the pool index is the adapter's semantic
+  identity and is what appears in sequence state, snapshots and cache keys, while the slot index is
+  pure device residency and appears only in the three `adapters[row]` ingress writes and
+  `PrefillContext::adapter`. `lora_slot()` is the only translation between them.
   `plan_request_for_lane` refuses resident-prefix reuse unless it matches the request, so a lane
   holding another adapter's state simply reports zero reusable tokens and is treated as a full
   reset. `find_admission_lane` needs no adapter-specific rule because it already ranks lanes by
   planned reusable tokens.
 - Every continuation-cache alias is namespaced by adapter through `adapter_scoped_alias`, applied
-  to both the session `routing_hint` and the stable-prefix alias. Scoping is unconditional,
-  including the base weights, so no unscoped key exists and two adapters cannot collide.
-  `import_continuation_lane` takes the requesting adapter and stamps it onto the restored
-  sequence.
-- `slot_model_binding` folds the registered adapter names into the slot digest, so a slot image
-  cannot be restored into an engine with a different resident adapter set or bank order. The
-  binding pins the *set*; the session record pins *which* of them produced the image. Snapshot
-  version 2 carries `SnapshotSession::adapter`, written from `sequence.adapter` on save and
-  assigned back on restore. Before that field existed the restored lane kept whatever adapter its
-  previous occupant had left behind, which on a fresh lane is `-1`: a slot saved under an adapter
-  restored as base, and the very next base request with a matching prefix reused adapter-encoded
-  KV and GDN state. Because the binding already fixes the name list and its order, the index is
-  sufficient identity and the target never has to learn adapter names.
+  to both the session `routing_hint` and the stable-prefix alias. The scope string comes from
+  `Program::adapter_scope`, which returns the adapter's fingerprint rather than its pool index, for
+  the same reason the snapshot does. Scoping is unconditional, including the base weights, so no
+  unscoped key exists and two adapters cannot collide. `import_continuation_lane` takes the
+  requesting adapter and stamps it onto the restored sequence.
+- Snapshot version 4 carries `SnapshotSession::adapter` as a **32-byte SHA-256 content
+  fingerprint** of the adapter's artifact, all-zero meaning base weights. It is written from the
+  pool entry that produced the lane and resolved back to a pool index on restore, which then calls
+  `ensure_adapter_resident` before the image is accepted.
+
+  Versions 2 and 3 stored the bank index, which was sufficient identity only because
+  `slot_model_binding` folded the whole registered name list and its order into the slot digest.
+  A directory-discovered pool destroys that premise: adding one file renames every index after it,
+  and the binding cannot pin a set that is no longer declared. A fingerprint is positional-order
+  independent and survives the pool being reordered, extended, or pruned; an adapter that is no
+  longer in the directory now fails to resolve and the image is refused, where an index would have
+  silently restored the wrong adapter's state.
+
+  The surrounding model binding independently carries the complete base artifact's SHA-256. It no
+  longer carries the adapter name list: the base fingerprint pins the exact base weights, the
+  session fingerprint pins the exact adapter, and adding an unrelated pool entry changes neither.
+
+  Getting this wrong is not a cache miss. Before `SnapshotSession::adapter` existed at all, a
+  restored lane kept whatever adapter its previous occupant had left behind — a slot saved under an
+  adapter restored as base, and the next base request with a matching prefix reused adapter-encoded
+  KV and GDN state.
 
 ### 6.7 Speculative decoding
 
@@ -543,6 +625,45 @@ distribution fixed. The operational claim - enabling an adapter costs acceptance
 Published MTP figures in `performance.md` are base-model figures and do not describe adapted
 serving.
 
+### 6.8 Slot residency
+
+The pool lives on disk and in host mappings; the bank holds `slots` device slabs. The policy that
+connects them is in `ProgramImplCore` and is deliberately small.
+
+`ensure_adapter_resident(adapter, release_retained)` returns true if the adapter is already in a
+slot, refreshing its use clock. Otherwise it takes an empty slot, or failing that the least recently
+used slot that is not pinned, evicts it, stages the adapter, and returns true. It returns **false**
+only when every slot is pinned.
+
+A slot is pinned while any lane whose lifecycle is `Prefilling`, `Active` or `Pending` names its
+occupant. Those lanes hold KV and GDN state produced by that adapter's weights; changing the bytes
+underneath them would not fail, it would silently continue their generation against a different
+model. A merely `retained` lane is a *soft* hold: its request is finished, and its L1 state is a
+reuse optimization. Evicting its adapter hands it to the caller through `release_retained`, which
+lets the executor publish the session to L2/L3 and keep its own retention accounting straight —
+dropping the lane here would destroy the state instead of demoting it. Any remaining lane that still
+names the evicted adapter has its `adapter` reset to `-1`, so no idle lane can later be reused
+against weights that are no longer there.
+
+Staging is two-phase. Prepare reopens, fingerprints and assembles the artifact before any retained
+lane is displaced; ordinary file failures therefore leave residency untouched. Commit clears the
+slot identity, performs the one upload, and records the new occupant only on success.
+
+**Where it runs.** `try_admit_one` first proves the request fits and has a usable lane, then settles
+residency, then calls `try_restore_continuation`. That ordering prevents a rejected candidate from
+evicting unrelated retained state, while still ensuring restore never imports state for an adapter
+that cannot run. A false return is adapter-only contention: the scheduler drains rather than feeding
+it to the KV/lane protection policy, whose precondition is a request actually blocked by those
+resources. The request stays queued subject to its deadline. It cannot deadlock because an idle
+engine pins nothing, and it cannot starve because every admission pass evaluates the head before
+any backfill.
+
+**Cost.** One swap is a verified artifact reopen, bounded host assembly of one slab, and one
+contiguous upload: **46.8 ms** for an 80 MiB union slab without a fingerprint sidecar cache on this
+target, measured by `ninfer_qwen3_8_27b_lora_pool_test`. It runs on the worker thread between rounds,
+with no replay in flight, and is amortized against the prefill of the request that caused it.
+`lora_stage_count` counts swaps for anyone who wants to confirm a workload is not thrashing.
+
 ## 7. Serving and model routing
 
 Adapter names are registered as bare names; the served model id for each is
@@ -557,9 +678,9 @@ Adapter names are registered as bare names; the served model id for each is
 | `src/serve/openai_schema.{h,cpp}` | `make_models_list` takes the adapter model ids |
 | `src/serve/request.h` | `GenerationRequest::adapter` |
 | `src/serve/translate.cpp` | `options.execution.adapter = request.adapter` when non-empty |
-| `src/serve/serve_options.{h,cpp}` | `--lora NAME=PATH`, repeatable, plus usage text |
-| `src/serve/generation_service.cpp` | `engine_options.lora_adapters = options_.lora_adapters` |
-| `apps/cli/options.{h,cpp}`, `apps/cli/main.cpp` | `--lora NAME=PATH` (repeatable) and `--adapter NAME` |
+| `src/serve/serve_options.{h,cpp}` | `--lora-dir PATH`, `--lora-slots N`, `--lora-rank R`, plus usage text |
+| `src/serve/generation_service.cpp` | `engine_options.lora = options_.lora` |
+| `apps/cli/options.{h,cpp}`, `apps/cli/main.cpp` | the same three flags and `--adapter NAME` |
 | `include/ninfer/types.h` | `RequestErrorKind::UnknownAdapter`, mapped to 404 `model_not_found` on `param: "model"` |
 
 Still outstanding for the Responses and Anthropic surfaces: `responses_http.cpp` `validate_model`
@@ -567,13 +688,13 @@ and the Anthropic route, which must keep the documented "accept any Claude model
 contract while resolving a registered adapter name when one matches.
 
 ```
-ninfer-serve models/qwen3_8_27b.ninfer \
-  --lora qlora-math=adapters/math.lora.ninfer \
-  --lora qlora-python=adapters/python.lora.ninfer
+ninfer-serve models/qwen3_8_27b.ninfer --lora-dir adapters --lora-slots 4
 ```
 
-`model: "qwen3.8-27b"` → base. `model: "qwen3.8-27b-qlora-math"` → adapter index 0. Anything else
-→ 404 on the OpenAI surface.
+With `adapters/` holding `qlora-math.lora.ninfer` and `qlora-python.lora.ninfer`:
+`model: "qwen3.8-27b"` → base, `model: "qwen3.8-27b-qlora-math"` → the `qlora-math` adapter.
+Anything else → 404 on the OpenAI surface. `/v1/models` lists the base plus every pool entry,
+however large the pool is; `slots` bounds only how many are resident at once.
 
 ## 8. Cost model
 
@@ -582,7 +703,9 @@ At `r=16`, all seven sites, per adapter:
 | Quantity | Value |
 |---|---|
 | Parameters | 42,205,184 |
-| VRAM | 84.4 MB (675 MB for 8 adapters) |
+| VRAM | 84.4 MB **per slot** (169 MB at the default two slots) |
+| Host cost per pool entry | name, path, fingerprint, rank and site inventory |
+| Swap cost | 46.8 ms without a fingerprint cache — verify, assemble one slab, upload once |
 | Tensor objects | 368 |
 | Extra kernel launches per decode step | 144 (16 full-attention layers × 3, 48 GDN layers × 2) |
 | Extra bandwidth per decode step | 84.4 MB against an 18.2 GB base weight read — **0.46 %** |
@@ -594,7 +717,13 @@ open half of this section; the published claim must come from `bench/targets/qwe
 and `B=8` with 0, 1, and 8 adapters registered.
 
 Base requests served by a LoRA-enabled process pay the launch cost with `adapter_index = -1`,
-because graph topology is fixed at capture. A process started without `--lora` pays nothing.
+because graph topology is fixed at capture. A process started without `--lora-dir` pays nothing.
+
+Device cost is now set by `--lora-slots`, not by how many adapters are servable: the pool itself
+costs no VRAM. What the pool does cost is the union tax — every adapter executes the widest site set
+in the directory, so mixing a 6-site adapter into a directory containing a 7-site one gives up the
+1.2–1.6 % below for the narrow one. Splitting genuinely different site sets across separate
+directories and processes is the way to avoid that; it is not worth a second graph topology.
 
 ### 8.1 Prefill, measured
 
@@ -1149,10 +1278,16 @@ behaviour transfers, not that downstream task quality is unaffected by the base 
 1. **Excluded modules (§3).** `gate_proj`, `up_proj`, and the GDN input projections are outside v1.
    Including them requires an optional additive-input parameter in the `linear_swiglu` and
    `gdn_input_proj*` epilogues across four codecs.
-2. **`kMaximumLoraAdapters = 8`**, compile-time.
-3. **One rank per bank.** Mixed-rank adapters are rejected at load rather than zero-padded, so the
-   rank and every adapter stride stay kernel constants. The workspace is sized for
-   `kMaximumLoraRank` because the layout is frozen before any adapter artifact is read.
+2. **Unbounded pool, bounded slots.** Resolved 2026-08-30. `kMaximumLoraAdapters` is gone. The pool
+   is whatever `--lora-dir` contains; `--lora-slots` (default 2) bounds device residency and LRU
+   swapping fills it. See §6.8.
+3. **One union profile per bank.** Resolved 2026-08-30, reversing the original decision. Adapters
+   with differing site sets and ranks are normalized into the union of the pool's sites at the
+   pool's maximum rank, zero-padded, rather than rejected — the rank and every slot stride stay
+   kernel constants either way, and rejection would have made a directory of independently trained
+   adapters unusable. The cost is that every adapter pays for the widest one (§8). The workspace is
+   still sized for `kMaximumLoraRank` because the layout is frozen before any adapter is read.
+   `--lora-rank` caps the ceiling for anyone who would rather reject an outlier than pay for it.
 4. **MTP acceptance-rate degradation (§6.7)** is accepted and documented rather than fixed.
 5. **Anthropic endpoint (§7)** resolves registered adapter names and otherwise falls through to
    base, preserving its documented permissive contract.
@@ -1168,4 +1303,7 @@ behaviour transfers, not that downstream task quality is unaffected by the base 
 | Prefix-reuse leakage across adapters produces silently wrong output | §6.6 is a correctness requirement, covered in both directions by layer 4 with a live positive control, not an optimization |
 | 144 extra launches erode decode throughput more than projected | measured in phase 0d before any training investment; the Op groups four attention sites into one launch specifically to bound this |
 | Adapter trained on excluded modules is silently ignored | `convert_lora.py` hard-rejects rather than dropping |
-| Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_adapters == 0`; asserted in phase 0d |
+| Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_slots == 0`; asserted in phase 0d |
+| A slot swap corrupts a generating lane's state | a slot is pinned while any lane in `Prefilling`/`Active`/`Pending` names it, and admission refuses rather than displacing (§6.8) |
+| A restored continuation is replayed against the wrong adapter after the directory changes | identity is the artifact's SHA-256, not a pool position; an adapter that has left the directory fails to resolve and the image is refused (§6.6) |
+| A large pool thrashes its slots | `lora_stage_count` exposes the swap count; `--lora-slots` up to `--max-concurrency` removes admission stalls |

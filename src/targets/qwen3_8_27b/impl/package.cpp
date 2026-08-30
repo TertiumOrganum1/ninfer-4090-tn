@@ -95,26 +95,38 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 LoraAttachment Package::attach_lora(LoadedModel& model, const EngineOptions& options,
                                     DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    if (options.lora_adapters.empty()) { return {}; }
+    if (options.lora.directory.empty()) { return {}; }
+    if (options.lora.slots == 0) {
+        throw std::invalid_argument("a LoRA adapter directory needs at least one resident slot");
+    }
 
-    detail::LoadedLoraBank bank = detail::load_lora_bank(options.lora_adapters, device);
-    const std::uint64_t device_bytes = bank.device_bytes;
-    const std::uint64_t file_bytes   = bank.file_bytes;
-    detail::LoadedModelData& data    = model.impl_->data;
-    data.runtime.lora                = std::move(bank.view);
-    data.lora_arena                  = std::move(bank.arena);
-    data.lora_adapter_names          = std::move(bank.names);
-    // `lora_sizing_rank` already froze the workspace layout and must not be rewritten here; the
-    // bank's executed rank lives on the model view.
-    data.runtime.features.lora_adapters =
-        static_cast<std::uint32_t>(data.lora_adapter_names.size());
-    // The bank is its own arena, so the family memory summary can only account for it through
-    // the view the package populates here.
-    data.runtime.lora->device_bytes = device_bytes;
-    return LoraAttachment{.names        = data.lora_adapter_names,
-                          .rank         = data.runtime.lora->rank,
-                          .device_bytes = device_bytes,
-                          .file_bytes   = file_bytes};
+    // Adapter fingerprints share the base artifact's fingerprint cache, so the pool's SHA-256
+    // identities are computed once per file rather than once per process.
+    detail::LoraDiscovery discovery = detail::discover_lora_pool(
+        options.lora, artifact::FingerprintCacheOptions{
+                          .directory       = options.continuation_cache.directory,
+                          .cache_namespace = options.continuation_cache.cache_namespace});
+
+    detail::LoadedModelData& data = model.impl_->data;
+    data.lora_bank =
+        std::make_unique<detail::LoraBank>(std::move(discovery), options.lora.slots, device);
+    const detail::LoraBank& bank = *data.lora_bank;
+
+    // `StartupFeatures` froze the workspace layout and the schedule before the pool was scanned
+    // and must not be rewritten here: the plan the Program is constructed against carries the
+    // requested slot count, and rewriting it would fail the frozen-features check. A pool smaller
+    // than the request commits fewer slabs, and the bank's executed slot count and rank live on
+    // the model view, which is what bounds every selection.
+    data.runtime.lora = bank.view();
+
+    LoraAttachment attachment;
+    attachment.names.reserve(bank.pool().size());
+    for (const detail::LoraPoolEntry& entry : bank.pool()) { attachment.names.push_back(entry.name); }
+    attachment.rank         = bank.profile().rank;
+    attachment.slots        = bank.slots();
+    attachment.device_bytes = bank.device_bytes();
+    attachment.file_bytes   = bank.pool_file_bytes();
+    return attachment;
 }
 
 Package::Frontend Package::make_frontend(const LoadedModel& model,

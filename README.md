@@ -88,9 +88,10 @@ The work specific to this branch, each with the measurement that established it:
   carries a tooltip explaining what it measures and what it means when it moves. The same page
   replays a `--request-log-jsonl` file offline, and says so where a panel is live-only rather than
   drawing zeros. [Guide](docs/dashboard.md)
-- **Runtime LoRA adapters.** Up to eight externally trained QLoRA adapters are banked beside the
-  base artifact and selected per request by model id, so one process serves the base weights and
-  every adapter at once and mixes them inside a single decode batch. A resident but unselected bank
+- **Runtime LoRA adapters.** A directory of externally trained QLoRA adapters is served beside the
+  base artifact and selected per request by model id, so one process exposes the base weights and
+  every pooled adapter without reload. Requests for the resident adapters mix in one decode batch;
+  admission waits when all slots are pinned by other adapters. A resident but unselected bank
   costs nothing measurable in prefill; selecting one costs about 7-8%. Adapter identity is carried
   through prefix reuse, the continuation cache, and saved slot images, so cached state produced
   under one adapter can never be replayed under another. [Details](#runtime-lora-adapters)
@@ -577,23 +578,30 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
 
 ### Runtime LoRA adapters
 
-Externally trained QLoRA adapters are converted to `.ninfer` and registered at startup. There is no
-weight merging and no reload: the base artifact stays resident and each request selects an adapter
-by name.
+Externally trained QLoRA adapters are converted to `.ninfer` and discovered from a directory at
+startup. There is no weight merging and no reload: the base artifact stays resident and each request
+selects an adapter by name.
 
 ```bash
-ninfer-serve models/qwen3_8_27b.ninfer \
-  --lora math=lora/math.lora.ninfer \
-  --lora pirate=lora/pirate.lora.ninfer
+ninfer-serve models/qwen3_8_27b.ninfer --lora-dir lora --lora-slots 4
 ```
 
-This exposes `qwen3.8-27b`, `qwen3.8-27b-math` and `qwen3.8-27b-pirate` on `/v1/models`. Any mix of
-them can be in flight at once, including base requests, and the engine forms one compact decode
-batch across the whole mix. `--lora` is a serving option; the CLI has no adapter selection.
+Every `*.ninfer` in `lora/` becomes a servable model named after its file, so `math.lora.ninfer` and
+`pirate.lora.ninfer` expose `qwen3.8-27b`, `qwen3.8-27b-math` and `qwen3.8-27b-pirate` on
+`/v1/models`. Any mix can be queued together; base requests and adapters occupying the resident
+slots can be in flight at once, and the engine forms one compact decode batch across that mix. The
+same pool options are available in the CLI, where `--adapter NAME` selects one adapter.
 
-- **Eight adapters, one bank.** Every registered adapter shares one rank and one site inventory, so
-  the bank is a single indexed slab and selection is an index rather than a pointer swap. A
-  mismatched rank or site set is rejected at startup with the disagreeing name.
+- **Unbounded pool, bounded slots.** The number of servable adapters is limited only by disk — the
+  pool costs no VRAM. `--lora-slots` (default 2) sets how many are device-resident, and an adapter
+  the pool has but the slots do not is swapped in at admission, least-recently-used first, in about
+  47 ms without a fingerprint sidecar cache. A slot is never taken from a request that is still
+  generating against it; admission waits
+  instead. Setting `--lora-slots` to `--max-concurrency` removes waiting entirely.
+- **Mixed adapters in one bank.** Adapters with different ranks and different site sets coexist:
+  the bank executes the union of the directory's sites at its highest rank and zero-pads the rest,
+  which is numerically exact. The cost is that a narrow adapter pays the widest adapter's launch
+  count — worth about 1.2-1.6% of prefill for the GDN site.
 - **Seven registered sites.** Query, output-gate, key, value and attention output on the 16
   full-attention layers; the Gated DeltaNet output projection on the other 48; and the MLP down
   projection on all 64. At `r=16` that is 42,205,184 parameters and 84.4 MB per adapter. `gate_proj`,
@@ -603,8 +611,11 @@ batch across the whole mix. `--lora` is a serving option; the CLI has no adapter
 - **Adapter-scoped state.** KV and Gated DeltaNet state produced under one adapter is numerically
   invalid under another, so identity is enforced in three places: a resident lane records the
   adapter that produced it and refuses cross-adapter prefix reuse, every continuation-cache alias is
-  namespaced by adapter, and a saved slot image carries both the registered adapter set and the
-  index that produced it. Reusing one `prompt_cache_key` across adapters is a safe miss.
+  namespaced by adapter, and a saved slot image records the SHA-256 of the adapter artifact that
+  produced it. Content identity rather than a pool position is what makes a saved session survive
+  adapters being added to or removed from the directory; one that no longer resolves is refused
+  rather than replayed against a neighbour. Reusing one `prompt_cache_key` across adapters is a safe
+  miss.
 - **Measured cost.** With one adapter selected, prefill runs at 3,307 tok/s on a 9,411-token prompt
   and 3,017 tok/s on 37,798, against 3,601 and 3,247 for a base request in the same process — about
   8.2% and 7.1%. A resident bank costs base requests nothing measurable. The cost is activation

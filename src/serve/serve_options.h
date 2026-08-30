@@ -50,9 +50,9 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens = 8192;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
-    // Explicitly registered LoRA adapters, in bank order. Each one is served as an additional
-    // model id `<public model id>-<name>`; there is no directory discovery.
-    std::vector<LoraAdapterSpec> lora_adapters;
+    // Startup-discovered LoRA pool and its bounded device residency. Each filename-derived name
+    // is served as an additional model id `<public model id>-<name>`.
+    LoraOptions lora;
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

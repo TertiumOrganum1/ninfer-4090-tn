@@ -209,15 +209,15 @@ export const GLOSSARY = {
   // --- adapters ----------------------------------------------------------------------------
   adapterBank: {
     title: 'Adapter bank',
-    body: 'All registered LoRA adapters, packed into one device arena at startup. Every adapter shares one rank, so the rank and per-site strides are kernel constants. The bank is resident for the process lifetime — there is no load, unload, or activation path, and selection is a per-row index at execution time.',
+    body: 'A fixed number of device slots in one arena, drawn from an unbounded pool discovered from --lora-dir. Every slot shares one rank and one site geometry, so both are kernel constants; a narrower or lower-rank adapter is zero-padded into them, which contributes nothing. Selection is a per-row index at execution time, and the engine stages an adapter into the least recently used free slot at admission — the slot address never moves, so a swap is invisible to the captured graph.',
   },
   adapterVram: {
     title: 'Adapter VRAM',
-    body: 'The bank lives outside the weights arena and is committed before KV capacity is resolved, so it silently reduces the KV budget. It is reported separately here because it belongs to neither the weights nor the KV figure.',
+    body: 'Slots times one adapter slab. The bank lives outside the weights arena and is committed before KV capacity is resolved, so it silently reduces the KV budget. Pool size does not appear here: only resident slots cost VRAM.',
   },
   adapterUsage: {
     title: 'Per-adapter usage',
-    body: 'Completed requests grouped by the adapter that actually served them. A registered adapter with no rows is resident and costing VRAM without carrying traffic.',
+    body: 'Completed requests grouped by the adapter that actually served them. A pooled adapter with no rows costs disk and a directory entry, not VRAM — only the resident slots are committed.',
   },
 
   // --- GPU ---------------------------------------------------------------------------------

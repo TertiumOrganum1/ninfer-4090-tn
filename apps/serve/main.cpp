@@ -83,6 +83,21 @@ int main(int argc, char** argv) {
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
+        const ninfer::LoadSummary load = service.load_summary();
+        if (!load.lora_adapter_names.empty()) {
+            std::ostringstream adapters;
+            adapters << "LoRA pool: " << load.lora_adapter_names.size() << " adapters, "
+                     << load.lora_slots << " resident slots, rank " << load.lora_rank << ", "
+                     << format_bytes(load.lora_device_bytes) << " VRAM";
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, adapters.str());
+            for (const std::string& name : load.lora_adapter_names) {
+                ninfer::serve::write_console_log(
+                    ninfer::serve::ConsoleLogLevel::Info,
+                    "LoRA adapter: " + name + " (model id: " + server.public_model_id() + '-' +
+                        name + ')');
+            }
+        }
+
         const ninfer::MemorySummary memory = service.memory_summary();
         std::ostringstream capacity;
         capacity << "KV capacity "
