@@ -49,13 +49,11 @@ Runtime and Op references:
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Runtime LoRA adapters (Qwen3.8-27B)](maintainer/qwen3.8-27b-lora-adapters.md) is the current
-  authority for externally trained QLoRA adapters converted to `.ninfer`, banked alongside the base
-  artifact and selected per request by the served model name. Its contracts are pending migration
-  into the artifact, Op, architecture, and serving references.
-- [Unconditional persona adapter (Qwen3.8-27B)](maintainer/qwen3.8-27b-persona-adapter.md) is the
-  authority for the adapter-influence experiment: how the `datasets/caveman_pirate` corpus is
-  stratified so that an unprompted persona measures adapter strength, the seven-site r=32 training
-  configuration, the conversion-time `alpha` strength sweep, and the evaluation protocol.
+  authority for PEFT-to-`.ninfer` conversion, adapter artifacts, runtime banking and slot residency,
+  state isolation, and model-name routing. It does not own training.
+- Adapter training, target profiles, corpora and training reports are maintained in the separate
+  `llm-datasets` repository. Its Qwen3.8-27B contract is `docs/targets/qwen3_8_27b.md`, and its
+  unconditional-persona experiment is `docs/persona-adapter.md`.
 
 Artifact and model references:
 

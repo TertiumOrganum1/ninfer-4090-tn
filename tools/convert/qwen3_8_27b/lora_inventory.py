@@ -16,9 +16,9 @@ The vocabulary endpoints are absent for a different reason.  ``lm_head`` would
 satisfy that rule - its logits destination is already a plain contiguous BF16
 matrix - but this table and its object names are layer-indexed and have no slot
 for a site outside the decoder stack.  ``embed_tokens`` has no matmul
-destination at all, because ``ops::embedding`` is a gather.  See
-``tools/train/qwen3_8_27b/train_lora.py`` for what each unregistered module
-would cost and buy.
+destination at all, because ``ops::embedding`` is a gather.  The serving policy
+is documented in ``docs/maintainer/qwen3.8-27b-lora-adapters.md``; training-side
+module roles and experiments belong to the separate ``llm-datasets`` repository.
 
 Every site is described in *stored* terms.  ``hf_heads`` and ``hf_head_rows``
 describe the source ``lora_B`` row space, and ``hf_row_begin``/``hf_row_end``
@@ -221,9 +221,9 @@ for _spec in SITE_SPECS:
     SUPPORTED_HF_MODULES.setdefault(_leaf, ())
     SUPPORTED_HF_MODULES[_leaf] += (_spec.key,)
 
-# Rejected with an explicit message rather than silently dropped.  The four modules that
-# `train_lora.py --extra-modules` can train name what blocks them, so a training-side experiment
-# that reaches conversion gets a reason instead of a dead end.
+# Rejected with an explicit message rather than silently dropped. These reasons define NInfer's
+# conversion boundary; training-side experiments belong to the qwen3_8_27b target profile in the
+# separate llm-datasets repository.
 _SWIGLU_BLOCKER = (
     "the delta must land before silu(gate) * up inside ops::linear_swiglu, which needs an "
     "optional pre-activation addend in every schedule route"

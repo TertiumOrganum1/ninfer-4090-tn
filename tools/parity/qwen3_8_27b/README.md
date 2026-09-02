@@ -31,12 +31,13 @@ retention = [compliance(ninfer+adapter) - compliance(ninfer)]
           / [compliance(nf4+adapter)    - compliance(nf4)]
 ```
 
-The two NInfer arms are served by one running `ninfer-serve` with the adapter registered, so they
-share a single load and exercise per-request routing.
+The two NInfer arms are served by one running `ninfer-serve` that discovers the adapter, so they
+share a single load and exercise per-request routing. Put `loud.lora.ninfer` in its own directory —
+the served name is the filename stem with `.lora` stripped, giving `qwen3.8-27b-loud`.
 
 ```bash
 ./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer --port 8231 --greedy --no-thinking \
-  --lora loud=lora/loud.lora.ninfer &
+  --lora-dir lora/serve &
 
 python -m tools.parity.qwen3_8_27b.lora_transfer \
   --eval /tmp/opencode/loud/eval.jsonl \

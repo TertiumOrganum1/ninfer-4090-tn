@@ -3,17 +3,18 @@
 ## Status and scope
 
 Opened 2026-08-19; delivered 2026-08-20; the adapter pool replaced the fixed eight-adapter bank on
-2026-08-30. This file **is** the current implementation map for runtime LoRA. Every phase in §12 has
-landed and is exercised end to end on the real `groupwise-int` artifact, from Unsloth training
-through conversion, banking, execution and per-request serving.
+2026-08-30. This file **is** the current implementation map for Qwen3.8-27B LoRA conversion and
+runtime serving. Its boundary begins at a standard PEFT adapter directory produced outside NInfer.
+It owns conversion into `.lora.ninfer`, artifact validation, banking and slot residency, execution,
+adapter-scoped state, and request routing.
 
 It remains a transitional document. Its stable contracts still owe migration into the permanent
 authorities listed at the end of this section, after which this file is deleted.
 
-Deliverable: QLoRA adapters trained externally with Unsloth, converted to `.ninfer`, discovered
-from a directory alongside the base artifact, and selected **per request by the OpenAI/Anthropic
-`model` string** — `qwen3.8-27b` runs the unmodified base, `qwen3.8-27b-qlora-math` runs the base
-plus the `math` adapter, with no reload between requests.
+Deliverable: external PEFT adapters converted to `.ninfer`, discovered from a directory alongside
+the base artifact, and selected **per request by the OpenAI/Anthropic `model` string** —
+`qwen3.8-27b` runs the unmodified base, `qwen3.8-27b-qlora-math` runs the base plus the `math`
+adapter, with no reload between requests.
 
 The pool of servable adapters is unbounded and costs only host memory. Device residency is a
 separate, bounded resource: `--lora-slots` slabs are allocated at load and an adapter is swapped
@@ -26,13 +27,13 @@ In scope:
 - directory discovery, bounded slot residency with admission-time swapping, request routing, and
   prefix-reuse isolation;
 - serving-side model-name routing and `/v1/models`;
-- a synthetic-adapter bring-up ladder that validates all of the above **before** any checkpoint
-  download or training run;
-- the Unsloth training recipe and its constraints on this target.
+- a synthetic-adapter bring-up ladder that validates all of the above without a trained adapter.
 
-Out of scope: adapters for `qwen3.6-35b-a3b`, adapter training inside NInfer, adapter merging into
-base weights, rescanning the directory after startup, and target-module sets outside the registered
-contract. The pool is enumerated once at load; adding a file later requires a restart.
+Out of scope: adapter training, target profiles, corpora, training reports, adapters for
+`qwen3.6-35b-a3b`, adapter merging into base weights, rescanning the directory after startup, and
+target-module sets outside the registered contract. Training is owned by the separate
+`llm-datasets` repository. The pool is enumerated once at load; adding a file later requires a
+restart.
 
 Pending migration: the adapter inventory belongs in `qwen3.8-27b-artifact.md`, the Op contract in
 `op-development.md`, routing and prefix keying in `concurrent-inference-architecture.md`, and the
@@ -64,35 +65,16 @@ This is a discovery mechanism, which the "no plugin discovery" rule in `AGENTS.m
 exclude, so the distinction matters. The rule bars discovering *code paths* — execution is still
 fully determined by the compiled Variant and the registered base identity. What the directory
 enumerates is *weights in a registered format*: every entry is validated at load against the same
-inventory, shape and identity contract a `--lora`-named file was, and a file that fails it aborts
-the load. The directory changes how the set is named, not what may enter it.
+inventory, shape and identity contract, and a file that fails it aborts the load. The directory
+changes how the set is named, not what may enter it.
 
-## 2. Feasibility findings
+## 2. PEFT handoff findings
 
-### 2.1 The target is trainable
+Adapter training, the Qwen3.8-27B target profile and the pinned training environment are maintained
+in `llm-datasets/docs/targets/qwen3_8_27b.md`. NInfer's conversion and runtime paths consume the
+resulting standard PEFT adapter directory without importing or invoking that training stack.
 
-`qwen3.8-27b` converts from an HF checkpoint whose `model_type` is `qwen3_5` and whose
-`architectures` is exactly `["Qwen3_5ForConditionalGeneration"]`
-(`tools/convert/qwen3_8_27b/base_convert.py:37-46`, enforced at `:119`).
-
-| Component | Version | Evidence |
-|---|---|---|
-| `transformers` | 5.5.0 | `models/qwen3_5/` present (`configuration_qwen3_5.py`, `modeling_qwen3_5.py`) |
-| `unsloth` | 2026.8.18 | explicit `qwen3_5` handling |
-| `peft` / `trl` / `bitsandbytes` | 0.18.1 / 0.23.1 / 0.50.1 | |
-| torch | 2.11.0+cu130 | |
-
-Interpreter: `/home/ubuntu/.unsloth/studio/unsloth_studio/bin/python`.
-
-Unsloth routes `qwen3_5` through the generic `FastModel`/`FastBaseModel` path, not `FastQwen3Model`:
-
-- `unsloth/models/loader.py:131` — `qwen3_5` is on the float16 blocklist ("Qwen3.5 GDN layers
-  produce NaN grad norms in float16 training"). **Training must be bfloat16.**
-- `unsloth/models/loader.py:269` — `FLA_MODEL_TYPE_PREFIXES = ("qwen3_next", "qwen3_5",
-  "kimi_linear", "olmo_hybrid")`.
-- `unsloth/save.py:717-729` — `_is_qwen3_5_vlm()` recognizes `Qwen3_5ForConditionalGeneration`.
-
-### 2.2 HF module names and their NInfer destinations
+### 2.1 HF module names and their NInfer destinations
 
 From `transformers/models/qwen3_5/modeling_qwen3_5.py`:
 
@@ -108,50 +90,6 @@ From `transformers/models/qwen3_5/modeling_qwen3_5.py`:
 | `linear_attn.out_proj` | `:403` | `[5120,6144]` | `gdn/output` |
 | `mlp.gate_proj` / `up_proj` | `:701-702` | `[17408,5120]` | `mlp/gate_up` |
 | `mlp.down_proj` | `:703` | `[5120,17408]` | `mlp/down` |
-
-### 2.3 Blockers and prerequisites
-
-| # | Item | Status |
-|---|---|---|
-| B1 | BF16 Qwen3.8-27B checkpoint | **absent.** No `.safetensors` > 100 MB anywhere under `/home/ubuntu`; `~/.cache/huggingface/hub` holds only orphaned lock dirs for the AWQ and GGUF derivatives, which are unusable (`SOURCE_DTYPE = "BF16"` is a hard abort, `tools/convert/qwen3_8/common/recipe.py:22,319-321`). ~54 GB download. 145 GB free. **Required only for training (Phase 1+).** |
-| B2 | `flash-linear-attention` (`fla`) and `causal_conv1d` | **present** (`fla-core` 0.5.2, `causal_conv1d` 1.7.0), but installing them is not sufficient — see the trap below. `is_fast_path_available` (`modeling_qwen3_5.py:205`) is `all()` over **four** symbols, so a broken `causal_conv1d` also disables the working `fla` GDN kernels and drops the recurrence onto `torch_chunk_gated_delta_rule` / `torch_causal_conv1d_update`. |
-| B3 | `tools/reference/qwen3_8_27b/bindings.py:276,314` declares `text/token_embedding` and `text/output_head` as `Q6G64_F16S` | **defect.** The shipped artifact stores both as `W8G32_F16S` (verified against `models/qwen3_8_27b.ninfer`, 1,350,860,800 bytes each). The Python reference therefore cannot open the shipped artifact and raises `BindingError`. Stale leak from `base_inventory.py:48,91`. **Blocks the numerical oracle. Two-line fix, must land first.** |
-| B4 | GPU | RTX 4090, 24 GB, `sm_89`, driver 610.57.04. Sufficient for the engine work; tight but workable for 27B QLoRA text-only at `seq ≤ 1024`. |
-
-**B2 is installed-versus-enabled, and the difference is silent.** Both packages can import cleanly
-while the fast path stays off, announcing itself only as `The fast path is not available because
-one of the required library is not installed`. Unsloth widens the failure: at import,
-`patch_causal_conv1d_cuda_probe` (`unsloth_zoo/temporary_patches/misc.py:946`) runs a tiny
-`causal_conv1d_fn` forward and nullifies both entry points on *any* exception, printing
-`causal_conv1d CUDA kernels not compatible with this GPU`. That message is written for "no kernel
-image is available" on unsupported architectures, but it also fires on a wheel that merely
-disagrees with the installed libtorch — which then takes `fla` down with it via the `all()` gate.
-
-An ABI mismatch is the likely cause and is easy to misread: it fails on **every** dtype, `float32`
-included, with `Expected input_type == at::ScalarType::Float || ... to be true, but got false`,
-which reads like an unsupported-dtype error. A correctly built extension cannot reject all three of
-its own supported dtypes. Ada is *not* the problem — released wheels carry no `sm_89` cubin, but
-`sm_80` runs on 8.9 under CUDA minor-version forward compatibility, confirmed on this card.
-
-Verify after importing unsloth, since the veto is Unsloth's import-time patch and not transformers':
-
-```bash
-python3 -c "import unsloth, transformers.models.qwen3_5.modeling_qwen3_5 as m; print(m.is_fast_path_available)"
-```
-
-Repair by compiling against the torch actually installed in that environment. `--no-cache-dir` is
-load-bearing: without it pip silently reinstalls the same mismatched wheel from its cache, reporting
-`Using cached ...whl` and never invoking `nvcc`.
-
-```bash
-CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=$(nproc) python3 -m pip install \
-    --no-build-isolation --no-deps --force-reinstall --no-cache-dir \
-    --no-binary causal_conv1d "causal_conv1d==1.7.0"
-```
-
-Measured on this target at batch 32, fallback → fast path: steady-state decode 143.2 → 154.7 tok/s,
-and the prefill-bearing warmup pass 56.6 → 94.3 tok/s, at an unchanged 19.79 GiB peak. Training is
-a full-sequence forward/backward rather than a decode loop, so it sits nearer the second figure.
 
 ## 3. Scope decision — supported LoRA target modules
 
@@ -178,10 +116,10 @@ Supporting the excluded families requires an optional additive-input parameter t
 kernel families times four codecs. That is a separate project.
 
 The vocabulary endpoints are a different case: `lm_head` is a policy exclusion rather than a
-structural one, and `embed_tokens` needs a new Op rather than a modified epilogue.
-`tools/train/qwen3_8_27b/train_lora.py` carries the per-module role, cost and expected gain for all
-four unregistered modules, and its `--extra-modules` flag trains them for a training-side
-experiment; `convert_lora.py` still rejects the resulting adapter by name.
+structural one, and `embed_tokens` needs a new Op rather than a modified epilogue. Training-side
+module roles and experimental modules are owned by the `qwen3_8_27b` target profile in the separate
+`llm-datasets` repository; `convert_lora.py` remains authoritative at the handoff and rejects every
+unsupported module by name.
 
 **Registered v1 target-module set:**
 
@@ -192,10 +130,10 @@ experiment; `convert_lora.py` still rejects the resulting adapter by name.
 `out_proj` is `linear_attn.out_proj`; PEFT matches on the leaf name and it does not collide with
 `self_attn.o_proj`. Together these cover the complete attention block in all 16 full-attention
 layers, the down projection in all 64 layers, and the output projection in all 48 GDN layers.
-`train_lora.py` targets all six, so a trained adapter carries the complete registered table.
 `convert_lora.py` **hard-rejects** an adapter containing any excluded module rather than silently
-dropping it, and derives the site set from the objects actually present, so a narrower adapter
-converts but cannot share a bank with a complete one.
+dropping it and derives the site set from the objects actually present. Supported adapters with
+different site sets or ranks can share a pool because the runtime normalizes them into its union
+profile at the pool's maximum rank (§6.8).
 
 ### 3.1 Registered sites
 
@@ -241,11 +179,11 @@ path should not be economized on in three quarters of the layers - not because a
 demonstrated. Do not cite these runs as evidence that a 7-site adapter is better; cite them as the
 reason not to expect a large difference at `r=16` on a short schedule.
 
-The register arm reused the `datasets/caveman_pirate` corpus and its scorer as a convenient paired
-probe. It is **not** the persona measurement: it omits the two baselines, the per-stratum headline,
-the competence and JSON gates, and the strength sweep, and it runs at a rank and schedule that
-document specifies against. `docs/maintainer/qwen3.8-27b-persona-adapter.md` is the authority for
-adapter influence; nothing here should be read as a result for it.
+The register arm reused the `caveman_pirate` corpus and scorer from the separate `llm-datasets`
+repository as a convenient paired probe. It is **not** the persona measurement: it omits the two
+baselines, the per-stratum headline, the competence and JSON gates, and the strength sweep, and it
+runs at a rank and schedule that experiment specifies against. Its authority is
+`llm-datasets/docs/persona-adapter.md`; nothing here should be read as a result for it.
 
 ## 4. Adapter artifact contract
 
@@ -683,9 +621,9 @@ Adapter names are registered as bare names; the served model id for each is
 | `apps/cli/options.{h,cpp}`, `apps/cli/main.cpp` | the same three flags and `--adapter NAME` |
 | `include/ninfer/types.h` | `RequestErrorKind::UnknownAdapter`, mapped to 404 `model_not_found` on `param: "model"` |
 
-Still outstanding for the Responses and Anthropic surfaces: `responses_http.cpp` `validate_model`
-and the Anthropic route, which must keep the documented "accept any Claude model name and echo it"
-contract while resolving a registered adapter name when one matches.
+The Responses surface validates model names through the same route table. The Anthropic surface
+keeps its documented "accept any Claude model name and echo it" contract while resolving a
+registered adapter model id when one matches.
 
 ```
 ninfer-serve models/qwen3_8_27b.ninfer --lora-dir adapters --lora-slots 4
@@ -732,7 +670,7 @@ Prefill was outside the model above, and it is the larger term. RTX 4090 `sm_89`
 request discarded, three repeats, `prefill_tok_s` from the structured request log. SM clock held
 2715–2730 MHz at 465–475 W throughout, so no arm was throttled.
 
-| Prompt tokens | No `--lora` | Bank resident, base request | Adapter selected |
+| Prompt tokens | No `--lora-dir` | Bank resident, base request | Adapter selected |
 |---:|---:|---:|---:|
 | 9,411 | 3600 tok/s | 3601 tok/s | 3307 tok/s (**−8.2 %**) |
 | 37,798 | 3250 tok/s | 3247 tok/s | 3017 tok/s (**−7.1 %**) |
@@ -758,28 +696,19 @@ activation traffic — fusing the correction into the base epilogue — not the 
 ## 9. Synthetic adapter ladder
 
 A LoRA `A`/`B` pair is **independent of base weights** — only shapes matter, and those are fixed
-constants for this target. A synthetic adapter therefore needs no checkpoint download, no GPU
-training, and no Unsloth. Together with the already-present `models/qwen3_8_27b.ninfer` and
-`build-sm89/`, this decouples the entire engine implementation from blockers B1 and B2.
+constants for this target. A synthetic adapter therefore needs no source checkpoint or training
+stack. Together with `models/qwen3_8_27b.ninfer` and `build-sm89/`, this validates the complete
+NInfer conversion/runtime path without depending on an external producer.
 
 ```mermaid
 flowchart LR
-  subgraph P0["Phase 0 - no downloads, no training"]
-    G["make_synthetic_lora.py<br/>kind = zero | canary | random | distinct"] --> PEFT["PEFT-format dir<br/>adapter_config.json<br/>adapter_model.safetensors"]
-    PEFT --> CV["convert_lora.py"]
-    CV --> NA["x.lora.ninfer"]
-    NA --> ENG["Engine + Op + serving"]
-    NA --> REF["PyTorch reference oracle"]
-    ENG <--> REF
-  end
-  subgraph P1["Phase 1 - after BF16 download"]
-    BF["BF16 base"] --> Z0["get_peft_model, zero training steps<br/>= real PEFT zero adapter"]
-    Z0 -->|must reproduce tier 0 exactly| CV
-  end
-  subgraph P2["Phase 2"]
-    SFT["real SFT"] --> CV
-  end
-  P0 --> P1 --> P2
+  G["make_synthetic_lora.py<br/>kind = zero | canary | random | distinct"] --> PEFT["PEFT-format dir<br/>adapter_config.json<br/>adapter_model.safetensors"]
+  EXT["external PEFT producer"] --> PEFT
+  PEFT --> CV["convert_lora.py"]
+  CV --> NA["x.lora.ninfer"]
+  NA --> ENG["Engine + Op + serving"]
+  NA --> REF["PyTorch reference oracle"]
+  ENG <--> REF
 ```
 
 The generator emits **PEFT-format** directories rather than `.ninfer` directly, so the fixtures
@@ -810,8 +739,8 @@ lora_B = 0                  (exactly zero)
 delta  = B @ A = 0
 ```
 
-`B = 0` rather than `A = 0` because it is the real PEFT initialization, so Phase 1 can produce a
-byte-comparable adapter from the true pipeline.
+`B = 0` rather than `A = 0` because it is the standard PEFT initialization, so an external
+zero-step adapter can be compared with this synthetic tier.
 
 | Check | Criterion |
 |---|---|
@@ -899,8 +828,9 @@ the feature as a whole, because per-column adapter routing is the one genuinely 
 Register new C++ tests through `ninfer_add_test(...)` in `tests/CMakeLists.txt:9-32`. The
 real-artifact tests in `tests/targets/qwen3_8_27b/` read `NINFER_QWEN3_8_27B_WEIGHTS` and skip with
 exit 77 without it; layer 4 additionally needs `NINFER_QWEN3_8_27B_LORA_ZERO`,
-`NINFER_QWEN3_8_27B_LORA_TRAINED` and `NINFER_QWEN3_8_27B_LORA_GDN_ONLY`. The first two must share
-one inventory; the third is a one-site fixture built with
+`NINFER_QWEN3_8_27B_LORA_TRAINED` and `NINFER_QWEN3_8_27B_LORA_GDN_ONLY`. The first two use the same
+inventory so the test isolates adapter application from union-profile normalization; the third is a
+one-site fixture built with
 `make_synthetic_lora.py --kind random --sigma 0.2 --sites gdn/output` and gets its own Engine.
 
 Layer 4 exists because the coverage claim that used to stand here was false. It read: a zero adapter
@@ -920,10 +850,10 @@ Two properties of layer 4 matter, and both were established by disabling the fix
   probe. Its numerics are already covered by layer 1. Only an adapter with a learned behaviour
   gives the first token a direction to move in.
 
-Because all adapters in one bank share a rank and a site inventory, the zero arm must come from the
-same inventory as the trained arm — a 7-site synthetic beside a 6-site trained adapter is rejected
-at load. A zero-step PEFT adapter converted through the normal path satisfies this, and
-`make_synthetic_lora.py --sites` generates matching synthetics when a fuller bank is wanted.
+The zero arm uses the same rank and site inventory as the trained arm so this test does not conflate
+adapter application with union-profile normalization. A zero-step external PEFT adapter converted
+through the normal path satisfies this, and `make_synthetic_lora.py --sites` generates a matching
+synthetic when needed.
 
 Every check in layer 4 was confirmed by reverting the code it guards and observing the failure;
 each is written so the arm that fires is the arm that matters. Three properties turned out to be
@@ -953,153 +883,37 @@ absorb an unreserved allocation; only at one lane with no Vision is text prefill
 That configuration is also the product default, so the defect affected the most ordinary way to run
 an adapter at long context.
 
-The B3 defect that once blocked layer 3 is fixed: `tools/reference/qwen3_8_27b/bindings.py:276`
-and `:314` now read `W8`, matching `WeightsProfile::GroupwiseIntW8Endpoints`.
+The reference-binding defect that once blocked layer 3 is fixed:
+`tools/reference/qwen3_8_27b/bindings.py:276` and `:314` now read `W8`, matching
+`WeightsProfile::GroupwiseIntW8Endpoints`.
 
-## 11. Training recipe
+## 11. External training handoff
 
-Prerequisites: B1 (BF16 checkpoint) and B2 (`fla`, `causal_conv1d`) — and for B2, confirm the fast
-path is actually *enabled*, not merely installed (section 2.3).
+NInfer contains no adapter-training driver, dataset mixer, reward probe, or corpus, and its
+conversion/runtime paths have no training dependency. The optional parity evaluator can load an
+external producer's NF4 model to compare behavior, but does not train it. The separate
+`llm-datasets` repository owns `llmdata.train_lora`, `llmdata.train_grpo`, `llmdata.data_mix`, the
+Qwen3.8-27B target profile, dataset provenance, and `training_report.json`. Its training contract is
+`llm-datasets/docs/targets/qwen3_8_27b.md`; its persona experiment is maintained at
+`llm-datasets/docs/persona-adapter.md`.
 
-An earlier revision predicted the GDN torch fallback would "very likely exceed 24 GB even at
-`seq = 1024`". Measurement refutes that: the entire 200-step GRPO run of section 11.1 executed on
-the fallback at `max_seq_length = 1024` and peaked at 20.07 GiB, and rollout generation at 32
-concurrent sequences peaked at 19.79 GiB on both paths. The fallback's cost is throughput, not
-capacity, and the fast path does not lower the peak — so B2 is a speed prerequisite, and
-`max_seq_length` remains the memory control.
+The handoff consumed here is a standard PEFT adapter directory containing `adapter_config.json` and
+`adapter_model.safetensors`. `tools/convert/qwen3_8_27b/convert_lora.py` owns compatibility
+validation, rejection of unsupported modules, query/gate de-interleave, scale folding, and BF16
+`.lora.ninfer` materialization. NInfer neither trains nor merges the adapter.
 
-```python
-import unsloth                                   # must precede transformers
-from unsloth import FastModel
+## 12. Delivery evidence
 
-model, tok = FastModel.from_pretrained(
-    "/path/to/Qwen3.8-27B",
-    max_seq_length = 1024,                       # 2048 is risky on a 24 GB 4090
-    load_in_4bit   = True,
-    text_only      = True,                       # skip the vision tower
-    dtype          = None,                       # bfloat16; fp16 is blocked for qwen3_5
-)
-
-model = FastModel.get_peft_model(
-    model,
-    r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "out_proj"],  # section 3
-    use_gradient_checkpointing = "unsloth",
-    use_rslora = False, loftq_config = None, random_state = 3407,
-)
-
-# SFTConfig: per_device_train_batch_size=1, gradient_accumulation_steps=8,
-#            learning_rate=2e-4, optim="adamw_8bit", lr_scheduler_type="linear", seed=3407
-
-model.save_pretrained("out/adapters/math")       # adapter only
-```
-
-VRAM estimate at `r=16`, `seq=1024`, `bs=1`: NF4 weights ≈ 15.5 GB, LoRA parameters + gradients +
-8-bit optimizer state ≈ 0.25 GB, activations with Unsloth gradient checkpointing ≈ 1.5–3 GB, CUDA
-and cuBLAS overhead ≈ 1–2 GB. Roughly 20–22 GB of 24 GB. Reduce `max_seq_length` first if it does
-not fit.
-
-**Do not use `save_pretrained_merged`.** Two independent reasons:
-
-1. NInfer never needs a merged checkpoint — `convert_lora.py` consumes the adapter directly.
-2. It would not work anyway. `model.save_pretrained_merged` is bound to
-   `unsloth_generic_save_pretrained_merged` (`unsloth/save.py:7923`), which calls
-   `merge_and_overwrite_lora` (`unsloth/save.py:6395-6410`). That function resolves a 16-bit
-   sibling **by Hub name** through `INT_TO_FLOAT_MAPPER`
-   (`unsloth_zoo/saving_utils.py:2911`), which has no Qwen3.8 entry, and hard-raises when the
-   resolved base is nf4 and `merged_16bit` was requested (`saving_utils.py:2933-2939`).
-
-For completeness: merging is also numerically undesirable here. For every model type outside
-`_DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})` (`saving_utils.py:193`), Unsloth folds
-the adapter onto the downloaded `W16`, not onto `dequant(W4)` that training actually saw.
-
-### 11.1 Reinforcement learning — `tools/train/qwen3_8_27b/train_grpo.py`
-
-GRPO against a programmatic verifier, producing an adapter that converts and banks exactly like an
-SFT one: same six modules, same seven sites, 42,205,184 parameters and 368 objects at `r=16`.
-
-Rollouts run through the training model (`fast_inference=False`). That is Unsloth's documented
-route for this architecture, and it is also the only correct one available. vLLM does register
-`Qwen3_5ForCausalLM` with `SupportsLoRA`, but no vLLM that knows `qwen3_5` is co-installable with
-Unsloth: `unsloth 2026.8.19` pins `torch<2.12` and `transformers<=5.5.0`, and resolving against
-those caps yields vLLM 0.11.0 (with `transformers==5.5.0`) or 0.23.0 (unpinned, `transformers`
-4.57.6), both of which predate the architecture. Generating from the training model is not a
-concession: the behaviour policy *is* the target policy, so the importance ratio is exact, and the
-adapter is applied at the same seven sites during generation and during the gradient step. A
-separate engine could not be, which is also why NInfer cannot serve rollouts — its `groupwise-int`
-weights differ from the trained NF4 base by `E = 0.1073` against an adapter norm of `‖BA‖ = 0.0079`
-(section "Base-quantization mismatch"), a discrepancy roughly thirteen times the signal.
-
-Two implementation facts are load-bearing on this target.
-
-`text_only=True` collapses the model onto `Qwen3_5TextConfig`, which carries no `architectures`.
-`unsloth/models/vision.py:548` iterates that field unconditionally on the generate path, so every
-rollout raises `TypeError: 'NoneType' object is not iterable`. SFT never reaches it because SFT
-never generates. `clear_generation_max_length` addresses a second one: Qwen3.8 carries
-`max_length = 262144` on its runtime generation config, and `transformers/generation/utils.py:2339`
-therefore reports a `max_new_tokens`/`max_length` clash on every single generate() call.
-
-**Task selection is the decisive design step, and accuracy is the wrong statistic.** GRPO's
-advantage is a within-group z-score, so a problem whose `--group` samples all score alike
-contributes exactly zero gradient. What predicts trainability is the fraction of groups that are
-*not* unanimous. Measured on this base at `--group 4`, thinking-off, 16 problems per row:
-
-| task | mean reward | fully solved | informative groups |
-|---|---:|---:|---:|
-| `mini_sudoku` 4–6 empty | 0.626 | 0.516 | 0.750 |
-| **`mini_sudoku` 6–8 empty** | **0.266** | 0.125 | **0.938** |
-| `mini_sudoku` 8–10 empty | 0.191 | 0.109 | 0.938 |
-| `maze` d3–5 g5–6 | 0.203 | 0.203 | 0.438 |
-| `maze` d5–10 g5–10 | 0.062 | 0.062 | 0.125 |
-| `n_queens` remove 1–2 / 2–4 / 4–7 | 0.000 | 0.000 | 0.000 |
-
-`n_queens` scores exactly zero at every difficulty tried, including removing only one or two
-queens. It is unlearnable here in the strict sense — no sampled completion is ever correct, so
-there is nothing to reinforce — and it is also the task most likely to be chosen by inspection.
-`--calibrate` reports both columns before a run commits hours to a task.
-
-Measured run: `mini_sudoku` at 6–8 empty cells, `r=16`, `G=4`, 200 steps, `--beta 0`
-(no reference pass), `--generation-batch 16`, 512 problems, lr 5e-6. Peak **20.07 GiB of 23.54**,
-about 8.2 s/step, 56 minutes wall. Sampled training reward rose from 0.486 to 0.740 (first and
-last ten logged groups).
-
-Held out to a seed the run never saw, 64 problems, greedy, both arms on the same NF4 base with the
-adapter toggled rather than reloaded:
-
-| arm | mean | solved | mean completion tokens |
-|---|---:|---:|---:|
-| base | 0.6029 | 28/64 (0.438) | 61.1 |
-| adapter | 0.8624 | 35/64 (0.547) | 30.9 |
-
-Adapter better on 22 problems, worse on 1, tied on 41; sign test on the 23 discordant pairs gives
-two-sided `p = 5.7e-06`.
-
-Read that gain carefully. A large part of it is format compliance rather than solving ability:
-mean completion halves, and served through NInfer the *base* scores 0.044 against the adapter's
-0.645 mainly because the base narrates a step-by-step derivation and is cut off by the token
-budget before it emits a grid, while the adapter emits the bare grid. The verifier rewards a
-correctly formatted answer, so RLVR optimized the whole observable behaviour, not the arithmetic
-alone. The matched-format comparison above — where the base does answer concisely — is the
-defensible capability claim, and it is the smaller of the two numbers.
-
-`mask_truncated_completions` is off by default for the same reason. A correct grid terminates in
-about 32 tokens, so a completion that runs to the cap has failed the task's own format
-instruction and its zero reward is real signal; masking it measured 50–75% of samples discarded,
-which collapses the effective group size.
-
-## 12. Phasing
-
-| Phase | Gate | Blocked by |
+| Layer | Gate | Status |
 |---|---|---|
-| **0a** | Fix B3; add `make_synthetic_lora.py` and `convert_lora.py`; converter tests green | **done** — 31 tests |
-| **0b** | `ops::lora_delta_add` plus Op unit tests, tiers 1/2/3 | **done** — mutation-checked suite |
-| **0c** | Engine wiring — features, ingress `adapters[B]`, resident bank, correction points, request plumbing | **done** |
-| **0d** | Prefix/lane/slot isolation, CLI and serving routes, `/v1/models` | **done**, all four surfaces |
-| **1** | Install `fla` and `causal_conv1d`; `get_peft_model()` with **zero training steps** → real PEFT zero adapter → must reproduce tier 0 exactly | **done** |
-| **2** | Real SFT; convert; serve | **done** |
-| **3** | Reference LoRA path (§10 layer 3); prefill-application defect found and fixed; engine matches the reference | **done** |
+| Converter | `make_synthetic_lora.py` and `convert_lora.py`; inventory/value/rejection tests | **done** |
+| Op | `ops::lora_delta_add` against the independent oracle, tiers 1/2/3 | **done** |
+| Engine | ingress, resident bank, correction points, prefix/lane/slot isolation | **done** |
+| Product | CLI and serving routes, `/v1/models`, per-request model selection | **done** |
+| PEFT seam | external zero-step and trained PEFT directories convert and execute | **done** |
+| Reference | direct-PEFT reference path agrees with the engine and exposed the prefill defect | **done** |
 
-Phase 0 evidence, on the real 18.2 GB `groupwise-int` artifact with three synthetic adapters
+Synthetic/runtime evidence, on the real 18.2 GB `groupwise-int` artifact with three adapters
 resident:
 
 - a converted `.lora.ninfer` whose `B` is exactly zero is loaded, banked and executed, and its
@@ -1110,31 +924,17 @@ resident:
 - with three adapters registered, a request naming no adapter and a request naming the zero
   adapter both reproduce the base output exactly, while bank index 2 diverges — the banked stride
   addressing is correct;
-- unregistered name, foreign artifact identity, duplicate name and malformed `--lora` each fail
-  with a specific message;
+- unregistered name, foreign artifact identity, duplicate name and malformed adapter artifact each
+  fail with a specific message;
 - `ctest`: 92/92, including `ninfer_qwen3_8_27b_prefix_real_test` against the real artifact.
 
-Phase 1 was the seam test that proves Unsloth's on-disk key naming matches what `convert_lora.py`
-expects. `FastModel.from_pretrained(text_only=True)` does collapse
-`model.language_model.layers.N.*` to `model.layers.N.*`, and PEFT emits
+The external PEFT seam was checked with both zero-step and trained adapters. PEFT emits
 `base_model.model.model.layers.N.<module>.lora_{A,B}.weight`, which the converter accepts. A
 zero-step adapter converted to 272 objects / 33,554,432 parameters and reproduced the base output
-**byte-identically** through the engine, so the training toolchain and the artifact contract agree.
+**byte-identically** through the engine. A trained adapter converted to the same inventory and
+**changed greedy output** where the base and zero adapter agreed exactly.
 
-Phase 2 trained a real adapter and served it. Recipe and outcome:
-
-| Item | Value |
-|---|---|
-| base | `models/Qwen3.8-27B` BF16, frozen at bitsandbytes NF4 |
-| data | `unsloth/OpenMathReasoning-mini`, `cot[:1000]`, rendered through the model's own chat template |
-| shape | `r=16`, `alpha=32`, 6 sites, 33.5M trainable of 26.93B (0.12%) |
-| schedule | 120 steps, bs 1 × accum 8, lr 2e-4, `adamw_8bit`, linear, seed 3407, `max_seq_length` 1024 |
-| cost | 22 min wall, **17.9 GiB** peak of 24 GiB, ~11 s/step, 96% SM at ~478 W |
-| result | train loss 0.688 → 0.435 |
-
-The trained adapter converts to the same 272-object inventory and **changes greedy output** where
-the base and the zero adapter agree exactly. Serving evidence, one process, three model ids, no
-reload between requests:
+Serving evidence, one process, three model ids, no reload between requests:
 
 - `/v1/models` lists `qwen3.8-27b`, `qwen3.8-27b-math`, `qwen3.8-27b-zero`;
 - `/v1/chat/completions` with `qwen3.8-27b-zero` is byte-identical to the base, `qwen3.8-27b-math`
@@ -1145,28 +945,25 @@ reload between requests:
 - `/v1/messages` still accepts an arbitrary Claude model name and echoes it — the Anthropic
   contract is unchanged — while an adapter id routes to that adapter.
 
-Two operational notes worth keeping. All registered adapters must share one site inventory as well
-as one rank; registering a 7-site synthetic beside a 6-site trained adapter is rejected at load
-with an explicit message. And `FastModel.from_pretrained` returns a `Qwen3VLProcessor`, not a bare
-tokenizer, so a positional `tokenizer(text)` call is interpreted as *images*; use `text=` or
-`processor.tokenizer`.
+Adapters with different supported site sets and ranks are normalized into the pool's union profile
+at its maximum rank. `--lora-rank` caps that ceiling when admitting a wider adapter would be too
+expensive (§6.8).
 
 ### Base-quantization mismatch — measured, then refuted
 
 The behavioural non-transfer recorded below was real, reproducible, and **not** caused by the
 base-quantization mismatch. It was an engine defect: prefill never bound the selected adapter. The
 measurement and its refutation are both kept here, because the mismatch is still a genuine property
-of the training setup and the false attribution is the reason the defect survived a green test
-suite. **Skip to "What it actually was" for the conclusion.**
+of the external-producer/runtime handoff and the false attribution is the reason the defect survived
+a green test suite. **Skip to "What it actually was" for the conclusion.**
 
 An adapter is fitted with the frozen base held at bitsandbytes NF4 but served on top of the
-`groupwise-int` artifact. Recovered from the live loader, training holds the base at `nf4`,
-blocksize 64, **double-quantized scales** (nested blocksize 256), bf16 compute. The served base
-uses symmetric uniform codes against exactly-stored FP16 scales at the same group size, and is
-**Q5 at four of the six sites** — finer than NF4 — and Q4 at query and key. `q_proj` straddles
-both, its query half served from a Q4 matrix and its output-gate half from a Q5 one.
-`train_lora.py` now records this in `training_report.json`; neither the PEFT config nor the model
-config carries it.
+`groupwise-int` artifact. The external producer's `training_report.json` records an `nf4` frozen
+base at blocksize 64 with **double-quantized scales** (nested blocksize 256) and BF16 compute. The
+served base uses symmetric uniform codes against exactly-stored FP16 scales at the same group size,
+and is **Q5 at four of the six sites** — finer than NF4 — and Q4 at query and key. `q_proj`
+straddles both, its query half served from a Q4 matrix and its output-gate half from a Q5 one. Neither
+the PEFT config nor the model config carries the producer's frozen-base quantization.
 
 `tools/parity/qwen3_8_27b/lora_transfer.py` measured the 120-step math adapter over 60 held-out
 prompts at a 48-token greedy budget, with the prompt surface verified identical on both runners
@@ -1298,12 +1095,10 @@ behaviour transfers, not that downstream task quality is unaffected by the base 
 
 | Risk | Mitigation |
 |---|---|
-| B3 blocks the numerical oracle | fix first, in phase 0a |
-| 24 GB is insufficient for 27B QLoRA even text-only | install `fla` + `causal_conv1d`; start at `seq=1024`; fall back to `r=8` and `seq=512` |
 | Prefix-reuse leakage across adapters produces silently wrong output | §6.6 is a correctness requirement, covered in both directions by layer 4 with a live positive control, not an optimization |
-| 144 extra launches erode decode throughput more than projected | measured in phase 0d before any training investment; the Op groups four attention sites into one launch specifically to bound this |
+| 144 extra launches erode decode throughput more than projected | measured before accepting the runtime path; the Op groups four attention sites into one launch specifically to bound this |
 | Adapter trained on excluded modules is silently ignored | `convert_lora.py` hard-rejects rather than dropping |
-| Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_slots == 0`; asserted in phase 0d |
+| Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_slots == 0`; asserted by the base-route tests |
 | A slot swap corrupts a generating lane's state | a slot is pinned while any lane in `Prefilling`/`Active`/`Pending` names it, and admission refuses rather than displacing (§6.8) |
 | A restored continuation is replayed against the wrong adapter after the directory changes | identity is the artifact's SHA-256, not a pool position; an adapter that has left the directory fails to resolve and the image is refused (§6.6) |
 | A large pool thrashes its slots | `lora_stage_count` exposes the swap count; `--lora-slots` up to `--max-concurrency` removes admission stalls |

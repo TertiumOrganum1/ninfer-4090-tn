@@ -120,7 +120,8 @@ The 27B target additionally serves externally trained LoRA adapters, discovered 
 `--lora-dir` directory and selected per request by name. The pool is unbounded and costs no device
 memory; a startup-fixed `--lora-slots` device slabs are resident and are LRU-swapped at admission.
 Adapters are normalized to the union of the pool's sites at its highest rank. Adapter training,
-merging into base weights, rescanning the directory after startup, and adapters for
+target profiles, corpora and training reports belong to the separate `llm-datasets` repository.
+Merging into base weights, rescanning the directory after startup, and adapters for
 `qwen3.6-35b-a3b` are outside the current product.
 
 KV storage is selected at startup from BF16, INT8, and the rotated/E8-lattice codecs
