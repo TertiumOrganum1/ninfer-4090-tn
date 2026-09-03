@@ -80,12 +80,50 @@ The dashboard reads two channels because they answer different questions.
 | Channel | Kind | Carries |
 |---|---|---|
 | `GET /telemetry` | polled at 1 Hz | levels: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE | history: throughput samples and completed requests |
+| `GET /events` | SSE | history: throughput samples, board energy, and completed requests |
 
 Levels cannot be reconstructed by replaying deltas, and the event stream is bounded and lossy
 under backpressure, so the poll is always authoritative for current state. `/metrics` is not read
 by the dashboard: every counter it needs is already in the two channels above, in a form that does
 not require differencing scrapes.
+
+Board energy is the one sensor reading that is carried in the record stream rather than only in the
+poll, because it is an interval total rather than a level. The Energy panel therefore works on a
+replayed log; the GPU panel, which reports levels, does not.
+
+## Energy
+
+The Energy panel reports what the work costs, in joules. A watt-second is a joule, so tokens per
+watt-second and tokens per joule are the same figure; the panel reports joules per token, because
+energy composes additively across phases while a rate does not.
+
+Two denominators are shown because they answer different questions and neither substitutes for the
+other. **Served** divides all board energy by all tokens, including the draw while idle between
+requests; it is what the work actually costs and it degrades on a mostly idle server even when
+nothing about the engine changed. **Active** removes the measured idle baseline and tracks the
+schedule rather than the duty cycle, which is the figure to compare between two builds. On a board
+that idles near 76 W the two differ by a large factor, so showing only one would be misleading.
+
+Prefill and decode are split apart because prefill is compute-bound and draws far more power than
+memory-bound decode; attributing energy in proportion to time would systematically understate
+prefill. Prefill divides by computed prefill tokens, so prefix-cache hits do not flatter the
+kernels, and decode divides by committed decode tokens, which under MTP counts accepted tokens
+only — speculation burns compute on drafts that may be rejected, so it can raise tokens per second
+and joules per token at the same time.
+
+The board total is exact; the split is not. It is integrated from power samples the board refreshes
+at roughly 50 Hz, which is coarser than a decode round, so the panel publishes the residual — the
+share of measured energy the split and idle baseline together fail to explain — and marks the phase
+figures once it exceeds a tenth of the total. A few percent is the expected steady state and
+shrinks with window length; see `docs/performance.md`. Boards with no cumulative energy counter
+report the panel as unavailable rather than as zero.
+
+The **per 1M tokens** stat restates the served figure in watt-hours, which is the denominator
+inference is priced in and the unit electricity is billed in; one multiplication by a local rate
+makes it comparable to a published $/1M-token price. It is an exact rescale of joules per token by
+`1e6/3600` and carries no extra information. The per-token figures stay primary because energy
+composes additively across phases and a rescaled rate does not — prefill and decode joules-per-token
+can be combined against their own token counts, which is the operation the panel is built around.
 
 ## Reading the charts
 

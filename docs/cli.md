@@ -17,8 +17,8 @@ The default build contains Qwen3.8-27B. Commands using Qwen3.6-35B-A3B require c
 Exactly one of `--prompt` and `--messages` is required.
 
 Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
-canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
-written to stderr, so stdout can be redirected independently:
+canonical `weights_id`), timings, throughput, board energy, GPU memory, and speculative-decoding
+statistics are written to stderr, so stdout can be redirected independently:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \
@@ -213,6 +213,26 @@ part of cache compatibility. Cache manifests are currently development-versioned
 by a later build, in which case remove or rotate the namespace. See
 [Tiered continuation cache](continuation-cache.md) for all flags, permissions, sizing, and format
 status.
+
+## Energy
+
+The summary reports `board energy` for the request plus `energy per token`, the same figure restated
+as `energy per 1M tokens` in watt-hours, and a `prefill` and `decode` split in joules per token. A
+watt-second is a joule, so tokens per watt-second and tokens per joule are the same figure; energy is
+reported per token because it composes additively across phases while a rate does not. The
+per-million restatement is an exact rescale by `1e6/3600` into the denominator inference is priced
+in, so multiplying it by a local electricity rate gives a number comparable to a published
+$/1M-token price.
+
+The total is the board's own cumulative energy counter, read either side of the request, so it is
+exact. The phase split is integrated from instantaneous power at execution-unit boundaries and is an
+estimate; `energy unattributed` is the share of the measured total it does not account for. Prefill
+divides by tokens actually prefilled, so reused prompt tokens do not flatter it.
+
+These lines are omitted on a board with no cumulative energy counter, which many GeForce parts lack.
+Per-request energy is exact here only because the CLI runs one request at a time; board energy is a
+property of the device, so the server reports it per interval instead. It is also board energy, not
+system energy: the CPU, the rest of the platform, and power-supply losses are excluded.
 
 ## Context and memory
 

@@ -51,8 +51,18 @@ nlohmann::json arena_json(const ninfer::ArenaMemorySummary& arena) {
             {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
-nlohmann::json gpu_json(const GpuTelemetry& gpu) {
+nlohmann::json gpu_json(const GpuTelemetry& gpu, const ServerEnergyTotals& energy) {
     if (!gpu.available) { return {{"available", false}, {"error", gpu.error}}; }
+    // Null where the board implements no cumulative energy counter. Many GeForce parts do not, and
+    // a zero there would be indistinguishable from a board that drew nothing.
+    nlohmann::json energy_joules_total = nlohmann::json(nullptr);
+    nlohmann::json server_energy       = nlohmann::json(nullptr);
+    nlohmann::json idle_watts          = nlohmann::json(nullptr);
+    if (gpu.energy_available) { energy_joules_total = gpu.energy_joules_total; }
+    if (energy.available) {
+        server_energy = energy.board_joules_total;
+        idle_watts    = energy.idle_watts;
+    }
     return {{"available", true},
             {"name", gpu.name},
             {"uuid", gpu.uuid},
@@ -61,6 +71,10 @@ nlohmann::json gpu_json(const GpuTelemetry& gpu) {
             {"fan_percent", gpu.fan_percent},
             {"power_watts", gpu.power_watts},
             {"power_limit_watts", gpu.power_limit_watts},
+            {"energy_available", gpu.energy_available},
+            {"energy_joules_total", energy_joules_total},
+            {"server_energy_joules", server_energy},
+            {"idle_watts", idle_watts},
             {"utilization_gpu_percent", gpu.utilization_gpu_percent},
             {"utilization_memory_percent", gpu.utilization_memory_percent},
             {"sm_clock_mhz", gpu.sm_clock_mhz},
@@ -73,7 +87,7 @@ nlohmann::json gpu_json(const GpuTelemetry& gpu) {
             {"throttle_reasons", gpu.throttle_reasons}};
 }
 
-// One SSE frame carrying a complete schema-14 record. The record's own `event` field names the
+// One SSE frame carrying a complete schema-19 record. The record's own `event` field names the
 // frame so a browser can attach one listener per record type.
 std::string event_frame(std::string_view event, std::string_view payload) {
     std::string frame;
@@ -197,9 +211,45 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
+// Reconcile the executor's per-unit power integration against the board's own energy counter.
+//
+// The counter is exact; the split is not, because the board refreshes power at roughly 50 Hz and a
+// decode round is shorter than that. Time no execution unit claimed is priced at the measured idle
+// baseline, and whatever remains is reported as a residual so a consumer can decide whether the
+// split is trustworthy instead of being handed a number with its error hidden inside it.
+IntervalEnergy reconcile_interval_energy(const ninfer::RuntimeStats& previous,
+                                         const ninfer::RuntimeStats& current,
+                                         double interval_seconds,
+                                         const BoardEnergySample& board_energy) {
+    IntervalEnergy energy;
+    if (!board_energy.available || interval_seconds <= 0.0) { return energy; }
+    const auto monotonic_double = [](double before, double after) {
+        return after >= before ? after - before : after;
+    };
+    energy.available        = true;
+    energy.board_joules     = board_energy.joules;
+    energy.prefill_joules   = monotonic_double(previous.prefill_energy_joules,
+                                               current.prefill_energy_joules);
+    energy.decode_joules    = monotonic_double(previous.decode_energy_joules,
+                                               current.decode_energy_joules);
+    energy.accounted_seconds = monotonic_double(previous.energy_accounted_seconds,
+                                                current.energy_accounted_seconds);
+    energy.idle_watts        = board_energy.idle_watts;
+
+    const double unaccounted_seconds =
+        std::max(0.0, interval_seconds - energy.accounted_seconds);
+    energy.idle_joules = energy.idle_watts * unaccounted_seconds;
+    energy.residual_joules =
+        energy.board_joules - energy.prefill_joules - energy.decode_joules - energy.idle_joules;
+    energy.residual_fraction =
+        energy.board_joules > 0.0 ? energy.residual_joules / energy.board_joules : 0.0;
+    return energy;
+}
+
 ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previous,
                                               const ninfer::RuntimeStats& current,
-                                              double interval_seconds) {
+                                              double interval_seconds,
+                                              const BoardEnergySample& board_energy) {
     ninfer::RuntimeStats delta;
     const auto monotonic_delta = [](std::uint64_t before, std::uint64_t after) {
         return after >= before ? after - before : after;
@@ -298,7 +348,8 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
         .decode_rounds = monotonic_delta(previous.decode_rounds, current.decode_rounds),
         .decode_row_rounds = monotonic_delta(previous.decode_row_rounds,
                                              current.decode_row_rounds),
-        .scheduler         = current,
+        .energy = reconcile_interval_energy(previous, current, interval_seconds, board_energy),
+        .scheduler          = current,
         .continuation_delta = delta,
     };
 }
@@ -353,8 +404,9 @@ std::string_view unstreamed_content(const GenerationOutcome& outcome) {
 
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
-                                        double interval_seconds) {
-    return make_throughput_report_impl(previous, current, interval_seconds);
+                                        double interval_seconds,
+                                        const BoardEnergySample& board_energy) {
+    return make_throughput_report_impl(previous, current, interval_seconds, board_energy);
 }
 
 bool throughput_report_has_activity(const ThroughputReport& report) noexcept {
@@ -411,28 +463,92 @@ void HttpServer::run_stats_reporter() {
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
+    // Energy is differenced across every tick, including the idle ticks a throughput report skips,
+    // because an idle tick is the only place the idle baseline can be measured rather than assumed.
+    // The board counter costs milliseconds to read and is quantized to about 100 ms, so this thread
+    // is the right place for it: an execution thread could not afford the call, and a window
+    // shorter than a second or two would not resolve the counter's own step size.
+    std::optional<double> previous_energy   = read_board_energy_joules();
+    ninfer::RuntimeStats energy_anchor      = previous;
+    Clock::time_point energy_anchor_time    = previous_time;
+    double carried_joules                   = 0.0;
+
+    const auto tick = [&](const ninfer::RuntimeStats& current, Clock::time_point now) {
+        BoardEnergySample sample;
+        const std::optional<double> energy_now = read_board_energy_joules();
+        if (previous_energy && energy_now && *energy_now >= *previous_energy) {
+            const double consumed = *energy_now - *previous_energy;
+            carried_joules += consumed;
+            observe_idle_power(energy_anchor, current,
+                               std::chrono::duration<double>(now - energy_anchor_time).count(),
+                               consumed);
+            sample.available = true;
+            board_energy_joules_total_.store(
+                board_energy_joules_total_.load(std::memory_order_relaxed) + consumed,
+                std::memory_order_relaxed);
+            published_idle_watts_.store(idle_watts_, std::memory_order_relaxed);
+            energy_available_.store(true, std::memory_order_relaxed);
+        }
+        // A driver reload resets the counter. Dropping that one difference is correct; carrying a
+        // negative or restarted value into an interval would fabricate energy that was not used.
+        if (energy_now) { previous_energy = energy_now; }
+        energy_anchor      = current;
+        energy_anchor_time = now;
+        sample.joules      = carried_joules;
+        sample.idle_watts  = idle_watts_;
+        return sample;
+    };
+
     for (;;) {
         {
             std::unique_lock lock(stats_mutex_);
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
+        const ninfer::RuntimeStats current  = service_->runtime_stats();
+        const Clock::time_point now         = Clock::now();
+        const BoardEnergySample board       = tick(current, now);
+        const ThroughputReport report       = make_throughput_report(
+            previous, current, std::chrono::duration<double>(now - previous_time).count(), board);
         if (throughput_report_has_activity(report)) {
             log_throughput(report);
-            previous      = current;
-            previous_time = now;
+            previous       = current;
+            previous_time  = now;
+            carried_joules = 0.0;
         }
     }
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
+    const BoardEnergySample board      = tick(current, now);
     const ThroughputReport tail        = make_throughput_report(
-        previous, current, std::chrono::duration<double>(now - previous_time).count());
+        previous, current, std::chrono::duration<double>(now - previous_time).count(), board);
     if (throughput_report_has_activity(tail)) { log_throughput(tail); }
+}
+
+std::optional<double> HttpServer::read_board_energy_joules() const {
+    return gpu_.power().energy_joules();
+}
+
+void HttpServer::observe_idle_power(const ninfer::RuntimeStats& before,
+                                    const ninfer::RuntimeStats& after, double seconds,
+                                    double joules) {
+    // Only a tick during which no execution unit ran at all, with nothing running or queued,
+    // measures the idle draw. Anything else mixes execution into the baseline and would inflate it,
+    // which would then be subtracted from the phases and understate their cost.
+    if (seconds <= 0.0 || joules <= 0.0) { return; }
+    if (after.energy_accounted_seconds != before.energy_accounted_seconds) { return; }
+    if (after.running_requests != 0 || after.waiting_requests != 0) { return; }
+    const double observed = joules / seconds;
+    idle_watts_ = idle_watts_ == 0.0 ? observed : 0.75 * idle_watts_ + 0.25 * observed;
+}
+
+ServerEnergyTotals HttpServer::energy_totals() const {
+    ServerEnergyTotals totals;
+    totals.available = energy_available_.load(std::memory_order_relaxed);
+    totals.board_joules_total = board_energy_joules_total_.load(std::memory_order_relaxed);
+    totals.idle_watts         = published_idle_watts_.load(std::memory_order_relaxed);
+    return totals;
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -557,7 +673,7 @@ void HttpServer::register_routes() {
     server_.Get("/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
         handle_telemetry(req, res);
     });
-    // The schema-14 record stream, identical to what --request-log-jsonl appends, as named SSE
+    // The schema-19 record stream, identical to what --request-log-jsonl appends, as named SSE
     // events. A new reader is replayed the retained server_start record and the recent ring
     // before live delivery begins.
     server_.Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -566,7 +682,8 @@ void HttpServer::register_routes() {
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency,
                                         service_ != nullptr ? service_->runtime_stats()
-                                                            : ninfer::RuntimeStats{}),
+                                                            : ninfer::RuntimeStats{},
+                                        energy_totals()),
                         "text/plain; version=0.0.4");
     });
     // llama.cpp-shaped slot detail, read from the Engine's real lane table: a busy lane
@@ -796,7 +913,7 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
          std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at_).count()},
         {"attached", service_ != nullptr},
         {"model_id", public_model_id_},
-        {"gpu", gpu_json(gpu_.read())},
+        {"gpu", gpu_json(gpu_.read(), energy_totals())},
         {"scheduler", std::move(scheduler)},
         {"cache", std::move(cache)},
         {"slots", std::move(slots)},

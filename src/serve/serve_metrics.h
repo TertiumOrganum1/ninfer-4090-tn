@@ -21,6 +21,19 @@
 
 namespace ninfer::serve {
 
+// Board energy accumulated since this server started, and the idle draw measured while it had
+// nothing to run. Both come from the interval reporter, which owns the only affordable place to
+// read the board's cumulative energy counter.
+//
+// Energy since server start rather than since driver load: a counter scoped to the process is what
+// a scraper can attribute to this server, and it starts at zero rather than at whatever the board
+// had already drawn. Driver-reload resets are dropped by the reporter, never carried through.
+struct ServerEnergyTotals {
+    bool available             = false;
+    double board_joules_total  = 0.0;
+    double idle_watts          = 0.0;
+};
+
 class ServeMetrics {
 public:
     // In-flight bookkeeping, hooked on the request start/done/error log
@@ -58,8 +71,11 @@ public:
     // `live` supplies the four llamacpp token/seconds counters from the Engine's per-unit
     // totals, so scrapers see rates advance during a request; the completion-based sums this
     // class accumulates back the ninfer: series and the idle slot display.
+    // `energy` is omitted entirely when the board exposes no cumulative counter, so a scraper sees
+    // no series rather than a flat zero it would read as a working meter.
     [[nodiscard]] std::string render(std::uint32_t max_concurrency,
-                                     const ninfer::RuntimeStats& live) const;
+                                     const ninfer::RuntimeStats& live,
+                                     const ServerEnergyTotals& energy = {}) const;
 
 private:
     mutable std::mutex mutex_;

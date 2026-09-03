@@ -1,9 +1,16 @@
 import { expect, test } from 'bun:test'
 
-import { percentile, summarizeByAdapter, summarizeChurn, summarizeRequests } from './derive'
+import {
+  percentile,
+  summarizeByAdapter,
+  summarizeChurn,
+  summarizeEnergy,
+  summarizeRequests,
+} from './derive'
+import { energyPerMillionTokens, WH_PER_MILLION_TOKENS_PER_JOULE } from './format'
 import { parseRecordLine, type RequestDoneRecord, type ThroughputRecord } from './records'
 
-// Fixture shaped like real schema-17 records: a mix of tier sources, one cold miss, one restore
+// Fixture shaped like real schema-19 records: a mix of tier sources, one cold miss, one restore
 // failure. Expected values below were produced by the reference implementation
 // (`cache_health.py`) over this same input, so a change here that drifts from the script fails.
 function done(
@@ -34,7 +41,7 @@ function done(
 ): RequestDoneRecord {
   return {
     event: 'request_done',
-    schema_version: 17,
+    schema_version: 19,
     server_instance_id: 'serve-test-1',
     timestamp_unix_ms: 1_700_000_000_000 + id * 1000,
     artifact_type: 'ninfer_serve_request_log',
@@ -101,8 +108,9 @@ function done(
   }
 }
 
-// Only the churn inputs vary; everything else is a plausible constant, because `summarizeChurn`
-// reads nothing but the eviction, restore-tier and publication deltas.
+// Only the churn and energy inputs vary; everything else is a plausible constant, because
+// `summarizeChurn` reads nothing but the eviction, restore-tier and publication deltas, and
+// `summarizeEnergy` reads nothing but the energy block and the interval token counts.
 function throughput(
   id: number,
   values: {
@@ -115,6 +123,9 @@ function throughput(
     l3Evictions?: number
     deferrals?: number
     superseded?: number
+    prefillTokens?: number
+    decodeTokens?: number
+    energy?: ThroughputRecord['energy']
   },
 ): ThroughputRecord {
   const zeroTier = {
@@ -136,13 +147,17 @@ function throughput(
   }
   return {
     event: 'throughput',
-    schema_version: 17,
+    schema_version: 19,
     server_instance_id: 'serve-test-1',
     timestamp_unix_ms: 1_700_000_000_000 + id * 10_000,
     artifact_type: 'ninfer_serve_request_log',
     interval_seconds: 10,
     throughput_tokens_per_second: { prefill: 0, decode: 0 },
-    tokens: { computed_prefill: 0, committed_decode: 0 },
+    energy: values.energy ?? null,
+    tokens: {
+      computed_prefill: values.prefillTokens ?? 0,
+      committed_decode: values.decodeTokens ?? 0,
+    },
     decode_batch: { rounds: 0, row_rounds: 0, average_size: null },
     scheduler: {
       running: 0,
@@ -486,4 +501,111 @@ test('adapter grouping keys on the resolved adapter, not the requested model', (
   record.request.adapter = 'caveman'
   const usage = summarizeByAdapter([record])
   expect(usage.map((entry) => entry.name)).toEqual(['caveman'])
+})
+
+// --- energy ----------------------------------------------------------------------------------
+
+function energyBlock(values: {
+  board: number
+  prefill: number
+  decode: number
+  idle: number
+  idleWatts: number
+}): ThroughputRecord['energy'] {
+  const residual = values.board - values.prefill - values.decode - values.idle
+  return {
+    board_joules: values.board,
+    prefill_joules: values.prefill,
+    decode_joules: values.decode,
+    idle_joules: values.idle,
+    idle_watts: values.idleWatts,
+    accounted_seconds: 0,
+    residual_joules: residual,
+    residual_fraction: values.board === 0 ? 0 : residual / values.board,
+    joules_per_token: { served: null, active: null, prefill: null, decode: null },
+  }
+}
+
+test('energy sums measured intervals and divides by the matching token counts', () => {
+  const records = [
+    throughput(1, {
+      prefillTokens: 1000,
+      decodeTokens: 100,
+      energy: energyBlock({ board: 1000, prefill: 200, decode: 400, idle: 380, idleWatts: 76 }),
+    }),
+    throughput(2, {
+      prefillTokens: 0,
+      decodeTokens: 100,
+      energy: energyBlock({ board: 600, prefill: 0, decode: 400, idle: 190, idleWatts: 76 }),
+    }),
+  ]
+  const energy = summarizeEnergy(records)
+
+  expect(energy.available).toBe(true)
+  expect(energy.boardJoules).toBe(1600)
+  expect(energy.prefillJoules).toBe(200)
+  expect(energy.decodeJoules).toBe(800)
+  expect(energy.idleJoules).toBe(570)
+
+  // Served prices every joule against every token; active removes only the measured idle draw.
+  expect(energy.servedJoulesPerToken).toBeCloseTo(1600 / 1200, 12)
+  expect(energy.activeJoulesPerToken).toBeCloseTo((1600 - 570) / 1200, 12)
+
+  // Each phase divides by its own denominator, never by the combined token count.
+  expect(energy.prefillJoulesPerToken).toBeCloseTo(200 / 1000, 12)
+  expect(energy.decodeJoulesPerToken).toBeCloseTo(800 / 200, 12)
+
+  // Residual is carried through as a share of the measured total, not recomputed from the parts.
+  expect(energy.residualFraction).toBeCloseTo((1600 - 200 - 800 - 570) / 1600, 12)
+})
+
+test('a phase that produced no tokens reports no energy per token rather than zero', () => {
+  // A decode-only window has no prefill denominator. Zero J/tok would read as "free", which is the
+  // opposite of "not measured", so the distinction has to survive into the summary.
+  const energy = summarizeEnergy([
+    throughput(1, {
+      prefillTokens: 0,
+      decodeTokens: 50,
+      energy: energyBlock({ board: 500, prefill: 0, decode: 300, idle: 200, idleWatts: 76 }),
+    }),
+  ])
+  expect(energy.prefillJoulesPerToken).toBeNull()
+  expect(energy.decodeJoulesPerToken).toBeCloseTo(6, 12)
+})
+
+test('a board with no energy counter reports unavailable rather than zero joules per token', () => {
+  const energy = summarizeEnergy([throughput(1, { prefillTokens: 1000, decodeTokens: 100 })])
+  expect(energy.available).toBe(false)
+  expect(energy.boardJoules).toBe(0)
+  expect(energy.servedJoulesPerToken).toBeNull()
+  expect(energy.residualFraction).toBe(0)
+})
+
+test('an empty energy window does not divide by zero', () => {
+  const energy = summarizeEnergy([])
+  expect(energy.available).toBe(false)
+  expect(energy.servedJoulesPerToken).toBeNull()
+  expect(energy.activeJoulesPerToken).toBeNull()
+  expect(Number.isFinite(energy.residualFraction)).toBe(true)
+})
+
+test('energy per million tokens is an exact restatement of joules per token', () => {
+  // 1 Wh is exactly 3600 J, so a million tokens at 3.6 J each is exactly 1 kWh. The whole point of
+  // the alternate denominator is that it is a pure rescale; if this drifts, two numbers on the same
+  // panel would describe the same measurement differently.
+  expect(3.6 * WH_PER_MILLION_TOKENS_PER_JOULE).toBeCloseTo(1000, 9)
+  expect(energyPerMillionTokens(3.6)).toBe('1.00 kWh')
+
+  // Measured on this target: prefill ~0.176 J/tok, decode ~3.80 J/tok, served ~0.504 J/tok.
+  // All three must land on a readable scale, which is why the formatter switches Wh/kWh.
+  expect(energyPerMillionTokens(0.1763)).toBe('49 Wh')
+  expect(energyPerMillionTokens(3.7993)).toBe('1.06 kWh')
+  expect(energyPerMillionTokens(0.5042)).toBe('140 Wh')
+})
+
+test('energy per million tokens reports absence rather than a zero cost', () => {
+  expect(energyPerMillionTokens(null)).toBe('—')
+  expect(energyPerMillionTokens(Number.NaN)).toBe('—')
+  expect(energyPerMillionTokens(-1)).toBe('—')
+  expect(energyPerMillionTokens(0)).toBe('0 Wh')
 })

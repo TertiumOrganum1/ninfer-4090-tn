@@ -42,13 +42,17 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
+  core/power_meter.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
+# NVML is part of the driver this engine already requires. It is linked here rather than in the
+# serving layer because board power is a device primitive: the executor integrates it across
+# execution units to attribute energy to prefill and decode, and the CLI brackets a request with it.
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 CUDA::nvml)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC

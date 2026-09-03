@@ -220,6 +220,30 @@ export interface ThroughputRecord extends RecordEnvelope {
   event: 'throughput'
   interval_seconds: number
   throughput_tokens_per_second: { prefill: number; decode: number }
+  /**
+   * Board energy for the interval, or null where the board exposes no cumulative energy counter.
+   *
+   * `board_joules` is measured by the board itself. The prefill and decode splits are integrated
+   * from instantaneous power at execution-unit boundaries and are estimates; `residual_fraction`
+   * is how much of the measured total those splits plus the idle baseline fail to explain, so a
+   * reader can tell a trustworthy split from a noisy one instead of being handed a bare number.
+   */
+  energy: {
+    board_joules: number
+    prefill_joules: number
+    decode_joules: number
+    idle_joules: number
+    idle_watts: number
+    accounted_seconds: number
+    residual_joules: number
+    residual_fraction: number
+    joules_per_token: {
+      served: number | null
+      active: number | null
+      prefill: number | null
+      decode: number | null
+    }
+  } | null
   tokens: { computed_prefill: number; committed_decode: number }
   decode_batch: { rounds: number; row_rounds: number; average_size: number | null }
   scheduler: {

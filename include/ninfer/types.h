@@ -670,6 +670,23 @@ struct RuntimeStats {
     // so counter scrapers see rates move during a request rather than at its completion.
     double prefill_seconds_total = 0.0;
     double decode_seconds_total  = 0.0;
+    // Board energy charged to prefill and decode units, in joules. Each unit is bracketed by two
+    // instantaneous board-power reads and integrated trapezoidally, so only the interval a unit
+    // actually occupied is attributed to it and time spent between units is left unaccounted here.
+    //
+    // These are estimates. The board refreshes power at roughly 50 Hz, so a single unit is not
+    // resolved; only the aggregate over many units converges. Their sum is reconciled against the
+    // exact NVML energy counter by the observer that samples it, and the leftover is published as
+    // a residual rather than folded silently into a phase. `energy_samples` is zero where the
+    // board exposes no power reading at all, which makes every derived figure absent, not zero.
+    double prefill_energy_joules = 0.0;
+    double decode_energy_joules  = 0.0;
+    // Wall time actually covered by those brackets. An observer subtracts it from its own interval
+    // to learn how much of the interval no phase claims, which is the only sound way to price the
+    // remainder at an idle baseline. It is tracked separately from the worker_* seconds because
+    // the first prefill chunk of a request runs inside admission and is timed there.
+    double energy_accounted_seconds = 0.0;
+    std::uint64_t energy_samples    = 0;
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds                      = 0;
     std::uint64_t decode_row_rounds                  = 0;

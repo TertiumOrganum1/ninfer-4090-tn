@@ -277,6 +277,44 @@ Json continuation_json(const GenerationMetrics& metrics) {
                 {"completion_publication_queued", value.completion_publication_queued}};
 }
 
+// Joules per token, or null where the denominator is zero. A rate over no tokens is not zero
+// energy per token, it is no measurement, and the two must not render the same.
+Json joules_per_token(double joules, std::uint64_t tokens) {
+    if (tokens == 0) { return Json(nullptr); }
+    return joules / static_cast<double>(tokens);
+}
+
+// Energy is reported per token rather than tokens per joule because energy composes additively
+// across phases and rates do not: prefill and decode joules-per-token can be summed against their
+// own token counts, whereas averaging tokens-per-joule would need a harmonic mean and silently
+// gives the wrong answer when it is done arithmetically.
+Json energy_json(const ThroughputReport& report) {
+    const IntervalEnergy& energy = report.energy;
+    if (!energy.available) { return Json(nullptr); }
+    const std::uint64_t total_tokens =
+        report.computed_prefill_tokens + report.committed_decode_tokens;
+    // `served` prices every joule the board drew, including the idle draw between requests, which
+    // is what an operator actually pays. `active` removes the measured idle baseline and is the
+    // figure that tracks the schedule rather than the duty cycle. They differ by a large factor on
+    // a mostly-idle server, so both are published instead of one standing in for the other.
+    return Json{{"board_joules", energy.board_joules},
+                {"prefill_joules", energy.prefill_joules},
+                {"decode_joules", energy.decode_joules},
+                {"idle_joules", energy.idle_joules},
+                {"idle_watts", energy.idle_watts},
+                {"accounted_seconds", energy.accounted_seconds},
+                {"residual_joules", energy.residual_joules},
+                {"residual_fraction", energy.residual_fraction},
+                {"joules_per_token",
+                 Json{{"served", joules_per_token(energy.board_joules, total_tokens)},
+                      {"active", joules_per_token(energy.board_joules - energy.idle_joules,
+                                                  total_tokens)},
+                      {"prefill", joules_per_token(energy.prefill_joules,
+                                                   report.computed_prefill_tokens)},
+                      {"decode", joules_per_token(energy.decode_joules,
+                                                  report.committed_decode_tokens)}}}};
+}
+
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.
 std::string rate(double tokens, double seconds) {
     std::ostringstream out;
@@ -480,6 +518,30 @@ std::string format_throughput(const ThroughputReport& report) {
         << report.continuation_delta.continuation_l1_restored_bytes << '/'
         << report.continuation_delta.continuation_l2_restored_bytes << '/'
         << report.continuation_delta.continuation_l3_restored_bytes;
+    if (report.energy.available) {
+        out << " energy=" << std::setprecision(1) << report.energy.board_joules << "J idle="
+            << report.energy.idle_watts << 'W';
+        out << " prefill_energy=";
+        if (report.computed_prefill_tokens != 0) {
+            out << std::setprecision(3)
+                << report.energy.prefill_joules /
+                       static_cast<double>(report.computed_prefill_tokens)
+                << "J/tok";
+        } else {
+            out << "n/a";
+        }
+        out << " decode_energy=";
+        if (report.committed_decode_tokens != 0) {
+            out << std::setprecision(3)
+                << report.energy.decode_joules /
+                       static_cast<double>(report.committed_decode_tokens)
+                << "J/tok";
+        } else {
+            out << "n/a";
+        }
+        out << " energy_residual=" << std::setprecision(1)
+            << (report.energy.residual_fraction * 100.0) << '%';
+    }
     return out.str();
 }
 
@@ -666,6 +728,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    // Null on boards with no cumulative energy counter, so a replayed log distinguishes "this
+    // server could not measure energy" from "this server used none".
+    record["energy"] = energy_json(report);
     record["scheduler"] = Json{
         {"running", report.scheduler.running_requests},
         {"prefilling", report.scheduler.prefilling_requests},

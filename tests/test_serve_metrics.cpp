@@ -10,6 +10,7 @@ namespace {
 using ninfer::serve::GenerationMetrics;
 using ninfer::serve::GenerationOutcome;
 using ninfer::serve::ServeMetrics;
+using ninfer::serve::ServerEnergyTotals;
 
 int check(bool ok, const char* label) {
     if (!ok) { std::printf("FAIL %s\n", label); }
@@ -188,6 +189,40 @@ int main() {
                           values.at("ninfer:continuation_l2_admission_microseconds_total") == 900.0 &&
                           values.at("ninfer:continuation_l3_persistence_operations_total") == 10.0,
                       "stable tier, reason, latency, and persistence metric names rendered");
+
+    // Without a board energy counter the series are absent, not zero: a scraper must not read a
+    // flat zero as a working meter reporting no consumption.
+    failures += check(rendered.find("ninfer:board_energy_joules_total") == std::string::npos &&
+                          rendered.find("ninfer:prefill_energy_joules_total") == std::string::npos,
+                      "energy series must be omitted when the board exposes no counter");
+
+    runtime.prefill_energy_joules    = 200.0;
+    runtime.decode_energy_joules     = 400.0;
+    runtime.energy_accounted_seconds = 6.0;
+    runtime.energy_samples           = 42;
+    ServerEnergyTotals energy;
+    energy.available          = true;
+    energy.board_joules_total = 1000.0;
+    energy.idle_watts         = 95.0;
+    const std::string metered      = metrics.render(1, runtime, energy);
+    const auto metered_values      = parse(metered);
+    // Counters only. Joules per token is deliberately not a series here: the denominators are
+    // already exported, so a scraper divides two rates over a window it chose rather than one
+    // fixed here, and an exported ratio would aggregate incorrectly across instances.
+    failures += check(metered_values.at("ninfer:board_energy_joules_total") == 1000.0 &&
+                          metered_values.at("ninfer:board_idle_watts") == 95.0 &&
+                          metered_values.at("ninfer:prefill_energy_joules_total") == 200.0 &&
+                          metered_values.at("ninfer:decode_energy_joules_total") == 400.0 &&
+                          metered_values.at("ninfer:energy_accounted_seconds_total") == 6.0 &&
+                          metered_values.at("ninfer:energy_samples_total") == 42.0,
+                      "board energy counters rendered");
+    failures += check(metered.find("# TYPE ninfer:board_energy_joules_total counter") !=
+                              std::string::npos &&
+                          metered.find("# TYPE ninfer:board_idle_watts gauge") != std::string::npos,
+                      "energy Prometheus types rendered");
+    failures += check(metered.find("ninfer:board_energy_joules_total NaN") == std::string::npos &&
+                          metered_values.count("llamacpp:prompt_tokens_total") == 1,
+                      "energy rendering must not disturb the existing series");
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));

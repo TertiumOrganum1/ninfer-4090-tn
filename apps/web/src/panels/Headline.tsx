@@ -1,6 +1,6 @@
 import { Stat, type Tone } from '../components/ui'
-import type { RequestSummary } from '../lib/derive'
-import { count, percent, rate, seconds } from '../lib/format'
+import { summarizeEnergy, type RequestSummary } from '../lib/derive'
+import { count, joulesPerToken, percent, rate, seconds } from '../lib/format'
 import type { ServerStartRecord, ThroughputRecord } from '../lib/records'
 import { latest } from '../lib/series'
 import type { Telemetry } from '../lib/telemetry'
@@ -44,6 +44,10 @@ export function Headline({
   // that was never taken, so they read as absent instead.
   const board = gpu?.available === true
 
+  // Energy is the exception: it is carried in the throughput record, so it survives a replay.
+  // Served rather than active, because the glance row should show what the work costs.
+  const energy = summarizeEnergy(records)
+
   return (
     <div className="headline">
       <Stat
@@ -84,6 +88,12 @@ export function Headline({
         label="mtp accept"
         hint="mtpAccept"
         tone={summary.speculative.acceptRate > 0.5 ? 'accent' : 'neutral'}
+      />
+      <Stat
+        value={energy.available ? joulesPerToken(energy.servedJoulesPerToken) : '—'}
+        unit={energy.available && energy.servedJoulesPerToken !== null ? 'J/tok' : undefined}
+        label="energy"
+        hint="energyServed"
       />
       <Stat
         value={board ? `${gpu.utilization_gpu_percent ?? 0}` : '—'}

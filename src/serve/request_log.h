@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 18;
+inline constexpr int kRequestLogSchemaVersion = 19;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -58,19 +58,47 @@ struct ServerLogEnvironment {
     std::string cuda_driver_version;
 };
 
+// One interval's board energy, exact where the board implements the cumulative counter.
+//
+// `board_joules` is measured; the prefill and decode splits are the executor's per-unit integration
+// of instantaneous power. `residual_joules` is what the splits and the idle baseline together fail
+// to explain, and it is published rather than distributed, because silently folding it into a phase
+// would make a wrong number look like a measured one.
+struct IntervalEnergy {
+    bool available            = false;
+    double board_joules       = 0.0;
+    double prefill_joules     = 0.0;
+    double decode_joules      = 0.0;
+    double accounted_seconds  = 0.0;
+    double idle_watts         = 0.0;
+    double idle_joules        = 0.0;
+    double residual_joules    = 0.0;
+    double residual_fraction  = 0.0;
+};
+
+// Exact board energy consumed over an interval, plus the idle baseline calibrated from intervals
+// that ran no execution unit at all.
+struct BoardEnergySample {
+    bool available    = false;
+    double joules     = 0.0;
+    double idle_watts = 0.0;
+};
+
 struct ThroughputReport {
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
+    IntervalEnergy energy;
     ninfer::RuntimeStats scheduler;
     ninfer::RuntimeStats continuation_delta;
 };
 
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
-                                        double interval_seconds);
+                                        double interval_seconds,
+                                        const BoardEnergySample& board_energy = {});
 [[nodiscard]] bool throughput_report_has_activity(const ThroughputReport& report) noexcept;
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string x_request_id,

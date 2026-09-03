@@ -235,7 +235,37 @@ export const GLOSSARY = {
   },
   gpuPower: {
     title: 'Power draw',
-    body: 'Instantaneous draw against the enforced limit. Sitting at the limit means clocks are being capped by power, which appears as sw_power_cap in the throttle reasons.',
+    body: 'Board draw against the enforced limit, averaged by the driver over a trailing second. Sitting at the limit means clocks are being capped by power, which appears as sw_power_cap in the throttle reasons.',
+  },
+
+  // --- energy ------------------------------------------------------------------------------
+  energyServed: {
+    title: 'Served energy per token',
+    body: 'Every joule the board drew over the window divided by every token it produced, including the draw while idle between requests. This is what the work costs, so it gets worse on a mostly idle server even when nothing about the engine changed. A watt-second is a joule, so tokens per watt-second and tokens per joule are the same figure; energy is reported per token because it composes additively across phases and a rate does not.',
+  },
+  energyActive: {
+    title: 'Active energy per token',
+    body: 'Board energy with the measured idle baseline removed, divided by tokens produced. This tracks the schedule rather than the duty cycle, so it is the figure to compare between two builds or two settings. It ignores what idling costs, which is why it is reported alongside served rather than instead of it.',
+  },
+  energyPrefill: {
+    title: 'Prefill energy per token',
+    body: 'Energy charged to prefill units divided by tokens actually prefilled — prefix-cache hits are excluded from the denominator, so restored tokens do not make this look better than the kernels are. Prefill is compute-bound and draws far more power than decode, which is why time-proportional attribution would be wrong and each phase is bracketed separately.',
+  },
+  energyDecode: {
+    title: 'Decode energy per token',
+    body: 'Energy charged to decode rounds divided by committed decode tokens. With MTP the denominator counts accepted tokens only, so this is where speculation is revealed as a net energy win or loss: drafting burns compute for tokens that may be rejected, which can raise tokens per second and energy per token at the same time.',
+  },
+  energyIdle: {
+    title: 'Idle draw',
+    body: 'Board draw measured over intervals in which no execution unit ran and nothing was queued. It is measured, not assumed, and it is what the unclaimed part of an interval is priced at. A high idle baseline makes served energy per token mostly a statement about duty cycle.',
+  },
+  energyPerMillion: {
+    title: 'Energy per million tokens',
+    body: 'The served figure restated in the denominator inference is priced in, in watt-hours. It is the same measurement as joules per token scaled by 1e6/3600 and carries no extra information; what it buys is a shared denominator. A watt-hour is the unit electricity is billed in and a million tokens is the unit inference is sold in, so multiplying this by a local electricity rate gives a number directly comparable to a published $/1M-token price. The per-token figures stay primary above because energy composes additively across phases and this restatement does not.',
+  },
+  energyResidual: {
+    title: 'Energy split residual',
+    body: 'Share of measured board energy that the prefill, decode, and idle figures together fail to explain. The total is exact — it comes from the board’s own counter — but the split is integrated from power samples the board refreshes at roughly 50 Hz, which is slower than a decode round. A large residual means read the split as indicative and trust only the total.',
   },
   gpuClock: {
     title: 'SM clock',

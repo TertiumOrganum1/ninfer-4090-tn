@@ -348,6 +348,86 @@ export function summarizeChurn(records: readonly ThroughputRecord[]): ChurnSumma
   }
 }
 
+export interface EnergySummary {
+  /** False when no record in the window carried energy, i.e. the board has no counter. */
+  available: boolean
+  boardJoules: number
+  prefillJoules: number
+  decodeJoules: number
+  idleJoules: number
+  /** Latest measured idle draw, in watts. */
+  idleWatts: number
+  prefillTokens: number
+  decodeTokens: number
+  /**
+   * Joules per token, or null where no tokens of that kind were produced.
+   *
+   * `served` prices every joule the board drew across the window, including the idle draw between
+   * requests; it is what the work actually costs and it degrades when the server is mostly idle.
+   * `active` removes the measured idle baseline and tracks the schedule rather than the duty
+   * cycle. They are both reported because neither answers the other's question.
+   */
+  servedJoulesPerToken: number | null
+  activeJoulesPerToken: number | null
+  prefillJoulesPerToken: number | null
+  decodeJoulesPerToken: number | null
+  /**
+   * Share of measured energy the phase splits and idle baseline together do not explain.
+   *
+   * The board refreshes power at roughly 50 Hz while a decode round is shorter than that, so the
+   * split is an estimate over a measured total. A large residual means the split should not be
+   * read closely; the total remains exact either way.
+   */
+  residualFraction: number
+}
+
+/** Energy per token, or null when the denominator is zero: no tokens is not zero joules each. */
+function perToken(joules: number, tokens: number): number | null {
+  return tokens === 0 ? null : joules / tokens
+}
+
+export function summarizeEnergy(records: readonly ThroughputRecord[]): EnergySummary {
+  let boardJoules = 0
+  let prefillJoules = 0
+  let decodeJoules = 0
+  let idleJoules = 0
+  let residualJoules = 0
+  let prefillTokens = 0
+  let decodeTokens = 0
+  let idleWatts = 0
+  let available = false
+  for (const record of records) {
+    const energy = record.energy
+    if (!energy) continue
+    available = true
+    boardJoules += energy.board_joules
+    prefillJoules += energy.prefill_joules
+    decodeJoules += energy.decode_joules
+    idleJoules += energy.idle_joules
+    residualJoules += energy.residual_joules
+    prefillTokens += record.tokens.computed_prefill
+    decodeTokens += record.tokens.committed_decode
+    // The baseline is a running calibration, so the most recent reading is the current one.
+    idleWatts = energy.idle_watts
+  }
+  const tokens = prefillTokens + decodeTokens
+  return {
+    available,
+    boardJoules,
+    prefillJoules,
+    decodeJoules,
+    idleJoules,
+    idleWatts,
+    prefillTokens,
+    decodeTokens,
+    servedJoulesPerToken: perToken(boardJoules, tokens),
+    activeJoulesPerToken: perToken(Math.max(0, boardJoules - idleJoules), tokens),
+    prefillJoulesPerToken: perToken(prefillJoules, prefillTokens),
+    decodeJoulesPerToken: perToken(decodeJoules, decodeTokens),
+    residualFraction: boardJoules === 0 ? 0 : residualJoules / boardJoules,
+  }
+}
+
 export const SOURCE_ORDER: readonly ContinuationSource[] = ['l1', 'l2', 'l3', 'none']
 
 /**

@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/power_meter.h"
 #include "ninfer/types.h"
 #include "runtime/cache/continuation_cache.h"
 #include "runtime/contract/types.h"
@@ -84,7 +85,8 @@ public:
           publication_l2_ttl_(std::chrono::seconds(
               options.continuation_cache.l2_idle_ttl_seconds)),
           publication_l3_ttl_(std::chrono::seconds(
-              options.continuation_cache.l3_idle_ttl_seconds)) {
+              options.continuation_cache.l3_idle_ttl_seconds)),
+          power_meter_(options.device) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -2107,20 +2109,52 @@ private:
         }
     }
 
+    // One instantaneous board-power read, or nullopt where the board exposes none. Measured at
+    // ~0.5 us mean / 0.8 us p99 on an RTX 4090, against execution units that cost tens of
+    // milliseconds, so bracketing every unit with two reads is free at this scale.
+    [[nodiscard]] std::optional<double> sample_board_watts() const {
+        return power_meter_.instant_watts();
+    }
+
+    // Charge [started, ended] to a phase accumulator. Both endpoint samples are boundary reads and
+    // units run back to back, so the trapezoid rule integrates continuously across a busy period:
+    // the closing sample of one unit is taken at essentially the same moment as the opening sample
+    // of the next. Time outside a unit bracket is deliberately not charged to any phase.
+    void accumulate_phase_energy(double& accumulator, const std::optional<double>& opening_watts,
+                                 const std::optional<double>& closing_watts,
+                                 Clock::time_point started, Clock::time_point ended) {
+        if (!opening_watts || !closing_watts) { return; }
+        const double seconds = std::chrono::duration<double>(ended - started).count();
+        if (seconds <= 0.0) { return; }
+        accumulator += 0.5 * (*opening_watts + *closing_watts) * seconds;
+        cumulative_stats_.energy_accounted_seconds += seconds;
+        ++cumulative_stats_.energy_samples;
+    }
+
     void timed_decode_round(const RoundMembership& membership) {
-        const auto started = Clock::now();
+        const auto started      = Clock::now();
+        const auto opening_watts = sample_board_watts();
         run_decode_round(membership);
+        const auto ended         = Clock::now();
+        const auto closing_watts = sample_board_watts();
         cumulative_stats_.worker_decode_seconds +=
-            std::chrono::duration<double>(Clock::now() - started).count();
+            std::chrono::duration<double>(ended - started).count();
         ++cumulative_stats_.worker_decode_rounds;
+        accumulate_phase_energy(cumulative_stats_.decode_energy_joules, opening_watts,
+                                closing_watts, started, ended);
     }
 
     void timed_prefill_step() {
-        const auto started = Clock::now();
+        const auto started       = Clock::now();
+        const auto opening_watts = sample_board_watts();
         run_prefill_step();
+        const auto ended         = Clock::now();
+        const auto closing_watts = sample_board_watts();
         cumulative_stats_.worker_prefill_seconds +=
-            std::chrono::duration<double>(Clock::now() - started).count();
+            std::chrono::duration<double>(ended - started).count();
         ++cumulative_stats_.worker_prefill_steps;
+        accumulate_phase_energy(cumulative_stats_.prefill_energy_joules, opening_watts,
+                                closing_watts, started, ended);
     }
 
     void run_prefill_step() {
@@ -2757,10 +2791,18 @@ private:
             publish_runtime_stats();
             target_started                = true;
             const auto unit_started       = Clock::now();
+            const auto opening_watts      = sample_board_watts();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            const auto unit_ended    = Clock::now();
+            const auto closing_watts = sample_board_watts();
             cumulative_stats_.prefill_seconds_total +=
-                std::chrono::duration<double>(Clock::now() - unit_started).count();
+                std::chrono::duration<double>(unit_ended - unit_started).count();
+            // The first chunk of every request runs here rather than in the worker loop's prefill
+            // branch. Charging it to prefill keeps admission from silently dropping out of the
+            // energy split, which for short prompts is the whole of their prefill.
+            accumulate_phase_energy(cumulative_stats_.prefill_energy_joules, opening_watts,
+                                    closing_watts, unit_started, unit_ended);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
@@ -3302,6 +3344,10 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    // Read only from the execution thread, at execution-unit boundaries. The expensive cumulative
+    // energy counter is deliberately never read here: it costs milliseconds and would land on the
+    // thread whose latency this engine exists to protect. An interval observer samples that.
+    core::PowerMeter power_meter_;
     AtomicContinuationStats continuation_stats_;
     StablePrefixFlights stable_flights_;
     std::vector<SlotState> published_slots_;

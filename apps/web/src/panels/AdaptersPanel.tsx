@@ -73,7 +73,7 @@ export function AdaptersPanel({
         ) : known ? (
           'none discovered'
         ) : (
-          // A schema-14 log and a pre-inventory engine both land here: usage is derivable, the
+          // A schema-19 log and a pre-inventory engine both land here: usage is derivable, the
           // resident bank is not.
           'usage only · no inventory reported'
         )

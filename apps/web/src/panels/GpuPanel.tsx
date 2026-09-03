@@ -19,11 +19,12 @@ export function GpuPanel({
   if (!gpu || !gpu.available) {
     return (
       <Panel title="GPU" hint={replay ? 'replayMode' : 'gpuUtil'} note="NVML">
-        {/* Board telemetry is sampled live and is not part of the record schema, so a replayed
-            file genuinely cannot supply it. */}
+        {/* Utilization, clocks, temperature and throttle reasons are sampled live and are not part
+            of the record schema, so a replayed file genuinely cannot supply them. Energy is the
+            one board reading the record does carry; the Energy panel works on a replay. */}
         <Empty>
           {replay
-            ? 'live only — a request log carries no board telemetry'
+            ? 'live only — a request log carries board energy but no live board telemetry'
             : gpu?.error
               ? `NVML unavailable: ${gpu.error}`
               : 'no board telemetry'}

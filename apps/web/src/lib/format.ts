@@ -55,3 +55,53 @@ export function rate(value: number): string {
 export function clock(unixMs: number): string {
   return new Date(unixMs).toLocaleTimeString('en-US', { hour12: false })
 }
+
+/**
+ * Energy, scaled so a long-running window and a single request read at the same precision.
+ *
+ * A watt-second is a joule, so there is only one unit here; kJ and MJ are the same unit scaled.
+ */
+export function joules(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 J'
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)} MJ`
+  if (value >= 1e3) return `${(value / 1e3).toFixed(2)} kJ`
+  return `${value.toFixed(1)} J`
+}
+
+/**
+ * Joules per token. Null renders as an em dash: no tokens of that kind is not zero energy each.
+ *
+ * Energy per token rather than tokens per joule because energy composes additively across phases
+ * while a rate does not — prefill and decode figures can be combined against their own token
+ * counts, whereas averaging tokens-per-joule arithmetically is simply wrong.
+ */
+export function joulesPerToken(value: number | null): string {
+  if (value === null || !Number.isFinite(value) || value < 0) return '—'
+  if (value >= 100) return value.toFixed(0)
+  if (value >= 1) return value.toFixed(2)
+  return value.toFixed(3)
+}
+
+/** Joules per token expressed per million tokens, in watt-hours. Exact: 1 Wh = 3600 J. */
+export const WH_PER_MILLION_TOKENS_PER_JOULE = 1e6 / 3600
+
+/**
+ * Energy per million tokens — the denominator inference is priced in.
+ *
+ * The same measurement as {@link joulesPerToken}, rescaled. It exists because a watt-hour is the
+ * unit electricity is billed in and a million tokens is the unit inference is sold in, so one
+ * multiplication by a local price gives a figure directly comparable to a published $/1M-token
+ * rate. Nothing here is derivable from this that is not derivable from J/token; the value is the
+ * shared denominator, not new information.
+ *
+ * Scales Wh to kWh so a cheap prefill token and an expensive decode token both read at the same
+ * precision: on this target they span roughly 49 Wh to 1.06 kWh per million.
+ */
+export function energyPerMillionTokens(joulesPerTok: number | null): string {
+  if (joulesPerTok === null || !Number.isFinite(joulesPerTok) || joulesPerTok < 0) return '—'
+  const wh = joulesPerTok * WH_PER_MILLION_TOKENS_PER_JOULE
+  if (wh >= 1000) return `${(wh / 1000).toFixed(2)} kWh`
+  if (wh >= 10) return `${wh.toFixed(0)} Wh`
+  if (wh > 0) return `${wh.toFixed(1)} Wh`
+  return '0 Wh'
+}

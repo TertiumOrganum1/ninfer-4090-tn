@@ -9,6 +9,7 @@ import { useEngine } from './lib/use-engine'
 import { AdaptersPanel } from './panels/AdaptersPanel'
 import { CachePanel } from './panels/CachePanel'
 import { ChurnPanel } from './panels/ChurnPanel'
+import { EnergyPanel } from './panels/EnergyPanel'
 import { GpuPanel } from './panels/GpuPanel'
 import { Headline } from './panels/Headline'
 import { LatencyPanel } from './panels/LatencyPanel'
@@ -104,6 +105,7 @@ export function App() {
         <ThroughputPanel records={state.throughput} lanes={lanes} />
         <SchedulerPanel telemetry={state.telemetry} records={state.throughput} engine={engine} />
         <GpuPanel gpu={state.telemetry?.gpu} history={state.gpu} replay={replay} />
+        <EnergyPanel records={state.throughput} gpu={state.telemetry?.gpu} replay={replay} />
         <MemoryPanel memory={state.telemetry?.memory} gpu={state.telemetry?.gpu} replay={replay} />
         <CachePanel cache={cache} summary={summary} replay={replay} />
         <ChurnPanel records={state.throughput} summary={summary} replay={replay} />

@@ -36,7 +36,7 @@ void decode_throttle_reasons(unsigned long long bits, std::vector<std::string>& 
 
 } // namespace
 
-GpuTelemetryReader::GpuTelemetryReader(int device) : device_(device) {
+GpuTelemetryReader::GpuTelemetryReader(int device) : device_(device), power_(device) {
     nvmlReturn_t status = nvmlInit_v2();
     if (status != NVML_SUCCESS) {
         error_ = std::string("nvmlInit_v2: ") + nvmlErrorString(status);
@@ -73,10 +73,8 @@ GpuTelemetryReader::GpuTelemetryReader(int device) : device_(device) {
     if (nvmlDeviceGetMaxClockInfo(handle, NVML_CLOCK_SM, &max_sm_clock) == NVML_SUCCESS) {
         identity_.sm_clock_max_mhz = max_sm_clock;
     }
-    unsigned int power_limit_mw = 0;
-    if (nvmlDeviceGetEnforcedPowerLimit(handle, &power_limit_mw) == NVML_SUCCESS) {
-        identity_.power_limit_watts = static_cast<double>(power_limit_mw) / 1000.0;
-    }
+    identity_.power_limit_watts = power_.power_limit_watts();
+    identity_.energy_available  = power_.energy_available();
 }
 
 GpuTelemetryReader::~GpuTelemetryReader() {
@@ -104,9 +102,15 @@ GpuTelemetry GpuTelemetryReader::read() const {
     }
     unsigned int fan = 0;
     if (nvmlDeviceGetFanSpeed(handle, &fan) == NVML_SUCCESS) { telemetry.fan_percent = fan; }
-    unsigned int power_mw = 0;
-    if (nvmlDeviceGetPowerUsage(handle, &power_mw) == NVML_SUCCESS) {
-        telemetry.power_watts = static_cast<double>(power_mw) / 1000.0;
+    // The averaged reading is the right one for a gauge sampled once per second; the executor takes
+    // the instantaneous one from the same meter for its per-unit integration.
+    if (const std::optional<double> watts = power_.average_watts()) {
+        telemetry.power_watts = *watts;
+    } else if (const std::optional<double> instant = power_.instant_watts()) {
+        telemetry.power_watts = *instant;
+    }
+    if (const std::optional<double> joules = power_.energy_joules()) {
+        telemetry.energy_joules_total = *joules;
     }
     nvmlUtilization_t utilization{};
     if (nvmlDeviceGetUtilizationRates(handle, &utilization) == NVML_SUCCESS) {

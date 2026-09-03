@@ -13,8 +13,17 @@ export interface GpuTelemetry {
   driver_version?: string
   temperature_c?: number
   fan_percent?: number
+  /** Driver-averaged over a trailing 1 s window, which is the right statistic at a 1 Hz poll. */
   power_watts?: number
   power_limit_watts?: number
+  /** False on boards with no cumulative energy counter; every energy field is then null. */
+  energy_available?: boolean
+  /** Board energy since driver load. Only meaningful as a difference within one driver session. */
+  energy_joules_total?: number | null
+  /** Board energy since this server started, accumulated by the interval reporter. */
+  server_energy_joules?: number | null
+  /** Board draw measured during intervals that ran no execution unit at all. */
+  idle_watts?: number | null
   utilization_gpu_percent?: number
   utilization_memory_percent?: number
   sm_clock_mhz?: number

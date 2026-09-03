@@ -58,7 +58,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
 | `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE stream of the schema-17 records `--request-log-jsonl` writes |
+| `GET /events` | SSE stream of the schema-19 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -92,7 +92,7 @@ reported apart from `restore_failures` because a deferral leaves the candidate l
 and a failure does not. The same counters appear on the throughput record as cumulative totals
 paired with interval deltas, so churn is readable from a replayed log as well as live.
 
-`GET /events` streams the same schema-17 records `--request-log-jsonl` appends, as named SSE
+`GET /events` streams the same schema-19 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
@@ -666,7 +666,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v12 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-19 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -677,12 +677,13 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
+| `throughput` | interval token deltas and rates, board energy, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
 
-`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
-derived downstream from raw token counts and seconds instead of rounded stderr strings.
+`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `queue`, `restore`, `publish`,
+`prefill`, `decode`, and `total` as full-precision JSON numbers. Its `speculative` object contains
+`backend`, `draft_window`, `rounds`, `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and
+`accepted_per_position`. Rates can be derived downstream from raw token counts and seconds instead
+of rounded stderr strings.
 
 `request_done.continuation_cache` reports stable `source` (`none`, `l1`, `l2`, `l3`), `alias_kind`
 (`none`, `routed_session`, `stable_prefix`), and `final_miss_reason` names, plus lookup/preflight/restore
@@ -718,6 +719,49 @@ lookup/preflight/restore operation timing, L2 admission, L3 persistence, and pub
 `occupancy` reports current L1/L2/L3 entries/bytes plus cumulative L1 evictions/demotions. Counter
 deltas tolerate a server/counter restart: when a current value is below the prior snapshot, the
 current value starts the new interval instead of underflowing.
+
+### Energy
+
+The throughput `energy` object reports the interval's board energy, or `null` where the GPU exposes
+no cumulative energy counter. Many GeForce boards do not implement one; `null` means the server
+could not measure energy, which is not the same as measuring none, so it is never reported as zero.
+
+`board_joules` is measured by the board itself and is exact. `prefill_joules` and `decode_joules`
+are estimates: the executor brackets every execution unit with two instantaneous board-power reads
+and integrates trapezoidally, because the cumulative counter costs milliseconds to read and advances
+in roughly 100 ms steps, which is coarser than a decode round. `idle_joules` prices the part of the
+interval that no execution unit claimed at `idle_watts`, itself measured over intervals during which
+nothing ran and nothing was queued. `residual_joules` and `residual_fraction` are what those three
+together fail to explain. The residual is published rather than distributed into a phase, so a
+consumer can see the estimator's error instead of inheriting it silently.
+
+`joules_per_token` carries four derived figures. `served` divides all board energy by all tokens,
+including the idle draw between requests, and is what the work costs; it degrades on a mostly idle
+server even when nothing about the engine changed. `active` removes the idle baseline and tracks the
+schedule rather than the duty cycle. `prefill` divides prefill energy by computed prefill tokens, so
+prefix-cache hits do not flatter the kernels. `decode` divides decode energy by committed decode
+tokens, which under MTP counts accepted tokens only — that is where speculation shows up as a net
+energy win or loss. Any of the four is `null` when its denominator is zero.
+
+A watt-second is a joule, so tokens per watt-second and tokens per joule are the same quantity.
+Energy is reported per token rather than as a rate because energy composes additively across phases
+and a rate does not: joules-per-token figures can be combined against their own token counts,
+whereas averaging tokens-per-joule arithmetically is wrong.
+
+The record carries only joules per token. The per-million-token restatement the dashboard and CLI
+also display is an exact rescale by `1e6/3600` into watt-hours, and is derived at display rather
+than stored: it is the denominator inference is priced in, so multiplying it by a local electricity
+rate gives a figure comparable to a published $/1M-token price, but it is the same measurement and
+carrying both in the schema would be redundancy that can drift.
+
+`GET /metrics` exports energy as counters only — `ninfer:board_energy_joules_total`,
+`ninfer:prefill_energy_joules_total`, `ninfer:decode_energy_joules_total`,
+`ninfer:energy_accounted_seconds_total`, `ninfer:energy_samples_total`, and the
+`ninfer:board_idle_watts` gauge. The token denominators are already exported, so a scraper divides
+two rates over a window it chose; the series are omitted entirely on a board with no counter.
+`ninfer:board_energy_joules_total` counts energy since this server started, not since driver load,
+and a driver-reload counter reset drops one difference rather than corrupting the total. `GET
+/telemetry` additionally reports the raw board counter as `gpu.energy_joules_total`.
 
 To verify interpretation, capture `/metrics`, send a cold request and a repeated routed request,
 then compare the completion records and counters. Retained reuse reports L1; evicting that lane and

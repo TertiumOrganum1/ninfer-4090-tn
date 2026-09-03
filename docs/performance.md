@@ -488,12 +488,14 @@ throughput only.
   --kv-dtype rk4v4-e8 --continuation-cache off --no-prefix-reuse
 ```
 
-Prefill rate is read from the structured request log (`prefill_tok_s`), not from HTTP round-trip
-timing, so prepare and vision time are excluded. Two hazards invalidate a prefill measurement if
-ignored: the continuation cache must be off, because a repeated prompt otherwise restores state
-instead of prefilling; and SM clock and power should be logged, because sustained prefill on this
-card can throttle and be misread as a kernel regression. Repeat measurements of one configuration
-reproduce to within 0.12%.
+Prefill rate is read from the structured request log, as `request_done.result.computed_prefill_tokens`
+over `request_done.timings_seconds.prefill`, not from HTTP round-trip timing, so prepare and vision
+time are excluded. Three hazards invalidate a measurement on this card if ignored: the continuation
+cache must be off, because a repeated prompt otherwise restores state instead of prefilling; SM clock
+and power should be logged, because sustained prefill on this card can throttle and be misread as a
+kernel regression; and for any energy claim the board's thermal state must be controlled, because
+efficiency drifts as the card heats and will otherwise alias onto whichever axis is being swept.
+Repeat measurements of one configuration reproduce to within 0.12%.
 
 ### Result
 
@@ -574,3 +576,102 @@ import call, and `preflight_microseconds` is logged separately; comparing the tw
 a restore regression. A cost model for the transfer alone is not a substitute: on this card
 37 KB pinned copies already reach 8.87 GB/s against 13.16 GB/s for 8 MB copies, so device transfer
 was never the dominant term in a restore, and host-side decoding was.
+
+### Energy measurement
+
+Energy per token is reported alongside throughput. A watt-second is a joule, so tokens per
+watt-second and tokens per joule are the same quantity; the engine reports joules per token, because
+energy composes additively across phases and a rate does not.
+
+Two NVML readings back it, and they have very different costs and resolutions. Measured on this
+board under driver 610.57.04:
+
+| Reading | Cost per call | Resolution | Role |
+|---|---:|---|---|
+| `nvmlDeviceGetTotalEnergyConsumption` | 2.4 ms (p50), 6.6 ms (max) | ~100 ms steps | exact interval total |
+| `NVML_FI_DEV_POWER_INSTANT` | 0.51 µs (mean), 0.79 µs (p99) | ~50 Hz board refresh | per-unit phase attribution |
+| `nvmlDeviceGetPowerUsage` | 1.6 µs | trailing 1 s average | not used |
+
+The cumulative counter is exact but cannot resolve a phase: a decode round is shorter than the
+counter's own step, and reading it costs more than a tenth of a round. It is therefore sampled only
+by the serving reporter thread, once per `--log-stats-interval-ms`. Differenced against integrated
+power it is accurate to −26.2% over a 0.5 s window, −12.3% over 1 s, −3.7% over 2 s, and −0.0% over
+5 s, which is why the default 5 s interval is the shortest sound window for an energy figure.
+
+Phase attribution instead brackets every execution unit with two instantaneous power reads and
+integrates trapezoidally, which is affordable on the execution thread at 0.5 µs against units costing
+tens of milliseconds. `nvmlDeviceGetPowerUsage` is not used at all: on Ampere and newer it returns a
+trailing 1 s average, which lags a prefill/decode transition by far more than the phase it would be
+attributing.
+
+That estimator is checked directly against the counter as its oracle. Replaying the executor's exact
+arithmetic over a sustained cuBLAS load, at controlled unit sizes matching both phases:
+
+| Unit size | Window | Exact counter | Estimator | Residual |
+|---|---:|---:|---:|---:|
+| 25 ms (decode round) | 5.8 s | 1,722.5 J | 1,641.6 J | +4.70% |
+| 25 ms | 5.8 s | — | — | +1.76% … +3.49% |
+| 150 ms (prefill chunk) | 5.9 s | 1,821.4 J | 1,760.3 J | +3.36% |
+| 25 ms | 30.8 s | 9,185.5 J | 9,132.7 J | **+0.57%** |
+
+The residual shrinks with window length, from 2–5% over six seconds to 0.6% over thirty. This is the
+expected behavior of a ~50 Hz sample against sub-refresh units and is why only the aggregate is
+claimed, never a single unit. The server publishes the residual per interval as
+`energy.residual_fraction` rather than folding it into a phase.
+
+### Measured energy
+
+From a live `ninfer-serve` under agent traffic: `qwen3.8-27b/groupwise-int`, `rk4v4-e8` KV,
+262,144-token context, `--max-concurrency 3`, `--prefill-chunk 1024`, `--spec mtp --draft-tokens 3
+--lm-head-draft`, continuation cache `l1-l2`. 97 reporting intervals covering 207.7 kJ, 374,807
+computed prefill tokens and 37,206 committed decode tokens. The board ran at ~436 W of its 480 W
+ceiling, 2,700 MHz, 60 °C.
+
+| Reading | J/token | Per 1M tokens |
+|---|---:|---:|
+| Prefill | 0.176 | 49 Wh |
+| Decode | 3.799 | 1.06 kWh |
+| Served (all board energy) | 0.504 | 140 Wh |
+| Active (idle baseline removed) | 0.493 | 137 Wh |
+
+**Decode costs 22× more energy per token than prefill.** That ratio is the practical argument
+against attributing energy in proportion to time: prefill is compute-bound and runs the board near
+its ceiling while producing tokens in bulk, and memory-bound decode produces one token per lane per
+round at a similar draw. A time-proportional split would have understated prefill efficiency by
+more than an order of magnitude.
+
+The engine measured its own idle baseline at **60.3 W** with the model resident, from intervals that
+ran no execution unit and had nothing queued. Idle was only 4.8 kJ of the 207.7 kJ in this window
+because the server was busy throughout; served and active differ by 2% here and would diverge
+sharply on a mostly idle server.
+
+Reconciliation against the board counter over the same window: **−2.16% aggregate**, with per-interval
+residuals at p50 −1.41% and p10/p90 of −11.9%/+7.1%. The aggregate is what the dashboard reports and
+what any claim should rest on; single intervals are noisier than the counter's own resolution
+supports. Note that prefill energy divides by `computed_prefill_tokens`, so a continuation cache
+being enabled does not flatter the figure — cache-served tokens are excluded from the denominator as
+well as from the work.
+
+### Reading energy figures
+
+Two denominators are published because they answer different questions. Joules per token is the
+engineering unit: it composes additively across phases, so prefill and decode figures can be combined
+against their own token counts. Energy per million tokens is the same measurement rescaled by
+`1e6/3600`, in the denominator inference is priced in; multiplying it by a local electricity rate
+gives a figure directly comparable to a published $/1M-token price. It carries no information the
+per-token figure does not, and it is not used as the primary unit because a rescaled rate does not
+compose across phases the way energy does.
+
+Three caveats bound any figure above. Board energy excludes the CPU, the rest of the platform, and
+power-supply losses, so it is not comparable to a wall-socket measurement. Energy per token is a
+function of the board's power ceiling rather than a fixed property of the engine, so a single number
+is not a result on its own: `scripts/prefill_probe.py --power-limit-sweep` produces the
+throughput/energy curve across ceilings. It randomizes point order across repeats and cools the board
+to a fixed temperature before each point, because a monotonic sweep lets rising temperature correlate
+with the power axis and be read as an efficiency trend that is really a thermal one. Setting the
+ceiling requires `nvidia-smi -pl` privileges; the sweep aborts rather than silently reporting every
+point at the same limit. This board accepts 150–530 W against a 480 W default.
+
+Per-request energy is well defined only at concurrency one, which is why the CLI reports it and the
+server does not: board energy is a property of the device, and with lanes sharing every decode round
+it cannot be attributed to a single request. The server reports energy per interval instead.

@@ -1,4 +1,5 @@
 #include "options.h"
+#include "core/power_meter.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
@@ -9,6 +10,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,6 +30,70 @@ std::string format_rate(double tokens, double seconds) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(2) << tokens / seconds << " tok/s";
     return output.str();
+}
+
+std::string format_joules(double joules) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(1) << joules << " J";
+    return output.str();
+}
+
+std::string format_joules_per_token(double joules, std::size_t tokens) {
+    if (tokens == 0 || joules <= 0.0) { return "n/a"; }
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3) << joules / static_cast<double>(tokens)
+           << " J/tok";
+    return output.str();
+}
+
+// The same measurement in the denominator inference is priced in. A watt-hour is the unit
+// electricity is billed in and a million tokens is the unit inference is sold in, so this is one
+// multiplication by a local rate away from a figure comparable to a published $/1M-token price.
+// It carries no information the per-token figure does not.
+std::string format_energy_per_million_tokens(double joules, std::size_t tokens) {
+    if (tokens == 0 || joules <= 0.0) { return "n/a"; }
+    const double watt_hours = joules / static_cast<double>(tokens) * 1e6 / 3600.0;
+    std::ostringstream output;
+    output << std::fixed;
+    if (watt_hours >= 1000.0) {
+        output << std::setprecision(2) << watt_hours / 1000.0 << " kWh / 1M tok";
+    } else if (watt_hours >= 10.0) {
+        output << std::setprecision(0) << watt_hours << " Wh / 1M tok";
+    } else {
+        output << std::setprecision(1) << watt_hours << " Wh / 1M tok";
+    }
+    return output.str();
+}
+
+// One request's board energy, bracketed around submit/wait.
+//
+// This is exact only because the CLI runs one request at a time. Board energy is a property of the
+// device, not of a request, so under the server's concurrent batching the same reading could not be
+// attributed to any single request; there it is reported per interval instead.
+struct RequestEnergy {
+    bool available          = false;
+    double board_joules     = 0.0;
+    double prefill_joules   = 0.0;
+    double decode_joules    = 0.0;
+    double unattributed     = 0.0; // fraction of board_joules no phase claimed
+};
+
+RequestEnergy measure_request_energy(const std::optional<double>& before,
+                                     const std::optional<double>& after,
+                                     const ninfer::RuntimeStats& stats_before,
+                                     const ninfer::RuntimeStats& stats_after) {
+    RequestEnergy energy;
+    if (!before || !after || *after < *before) { return energy; }
+    energy.available      = true;
+    energy.board_joules   = *after - *before;
+    energy.prefill_joules = stats_after.prefill_energy_joules - stats_before.prefill_energy_joules;
+    energy.decode_joules  = stats_after.decode_energy_joules - stats_before.decode_energy_joules;
+    if (energy.board_joules > 0.0) {
+        energy.unattributed =
+            (energy.board_joules - energy.prefill_joules - energy.decode_joules) /
+            energy.board_joules;
+    }
+    return energy;
 }
 
 std::string format_percent(std::uint64_t numerator, std::uint64_t denominator) {
@@ -175,7 +241,7 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+                              const ninfer::MemorySummary& memory, const RequestEnergy& energy) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -198,6 +264,22 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                  format_rate(static_cast<double>(decoded), result.timings.decode_seconds));
     print_metric("throughput (overall)",
                  format_rate(static_cast<double>(generated), model_seconds));
+
+    if (energy.available) {
+        // Board energy, not system energy: this excludes the CPU, the rest of the platform and
+        // power-supply losses, so it is not comparable to a wall-socket measurement.
+        const std::size_t prefilled = result.prompt.prompt_tokens - result.reused_prompt_tokens;
+        print_metric("board energy", format_joules(energy.board_joules));
+        print_metric("energy per token",
+                     format_joules_per_token(energy.board_joules, generated));
+        print_metric("energy per 1M tokens",
+                     format_energy_per_million_tokens(energy.board_joules, generated));
+        print_metric("prefill energy", format_joules_per_token(energy.prefill_joules, prefilled));
+        print_metric("decode energy", format_joules_per_token(energy.decode_joules, decoded));
+        std::ostringstream unattributed;
+        unattributed << std::fixed << std::setprecision(1) << (energy.unattributed * 100.0) << " %";
+        print_metric("energy unattributed", unattributed.str());
+    }
 
     const std::uint64_t reserved = static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
                                    memory.runtime_reservation_bytes;
@@ -317,9 +399,17 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
+        // The cumulative energy counter costs milliseconds to read, which is why the engine never
+        // touches it. Bracketing one synchronous request with two reads pays that cost twice, off
+        // any hot path, and yields the request's exact board energy.
+        const ninfer::core::PowerMeter power_meter(cli.device);
+        const std::optional<double> energy_before  = power_meter.energy_joules();
+        const ninfer::RuntimeStats stats_before    = engine.runtime_stats();
         ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
+        const std::optional<double> energy_after = power_meter.energy_joules();
+        const ninfer::RuntimeStats stats_after   = engine.runtime_stats();
         sink.finish_streams();
 
         if (cli.print_token_ids) {
@@ -330,7 +420,9 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary());
+        print_generation_summary(
+            result, sampling, engine.memory_summary(),
+            measure_request_energy(energy_before, energy_after, stats_before, stats_after));
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

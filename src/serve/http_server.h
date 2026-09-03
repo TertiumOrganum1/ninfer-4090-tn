@@ -70,6 +70,14 @@ private:
     void run_stats_reporter();
     void stop_stats_reporter();
 
+    // Written only by the reporter thread; the idle baseline needs no synchronization there.
+    [[nodiscard]] std::optional<double> read_board_energy_joules() const;
+    void observe_idle_power(const ninfer::RuntimeStats& before, const ninfer::RuntimeStats& after,
+                            double seconds, double joules);
+
+    // Published to /metrics and /telemetry, which are served from request threads.
+    [[nodiscard]] ServerEnergyTotals energy_totals() const;
+
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
@@ -87,6 +95,14 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    // Measured board draw with nothing executing, used to price the part of an interval that no
+    // execution unit claimed. Zero until an idle interval has actually been observed.
+    double idle_watts_ = 0.0;
+    // Board energy since this server started. Accumulated from reporter-thread differences so that
+    // a driver-reload reset drops one sample instead of fabricating or losing a whole total.
+    std::atomic<bool> energy_available_{false};
+    std::atomic<double> board_energy_joules_total_{0.0};
+    std::atomic<double> published_idle_watts_{0.0};
 };
 
 } // namespace ninfer::serve

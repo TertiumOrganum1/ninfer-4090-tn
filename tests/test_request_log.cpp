@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -442,6 +443,73 @@ int main() {
                     .at("delta_preflight_rejected") == 1 &&
             throughput_json.at("continuation_cache").at("occupancy").at("l1_entries") == 2,
         "throughput tier bytes, miss reasons, and occupancy missing");
+
+    // Energy is absent, not zero, when the board exposes no cumulative counter. A consumer must be
+    // able to tell "this server could not measure energy" from "this server used none".
+    failures += check(throughput_json.at("energy").is_null(),
+                      "throughput energy must be null without a board energy sample");
+
+    // The board counter is exact; the phase split is integrated from power samples. Reconciliation
+    // prices the time no execution unit claimed at the measured idle baseline and publishes what
+    // is left over, so a consumer can see the estimator's error instead of inheriting it silently.
+    ninfer::RuntimeStats energy_before;
+    ninfer::RuntimeStats energy_after;
+    energy_after.prefill_energy_joules    = 200.0;
+    energy_after.decode_energy_joules     = 400.0;
+    energy_after.energy_accounted_seconds = 6.0;
+    energy_after.computed_prefill_tokens  = 1000;
+    energy_after.committed_decode_tokens  = 100;
+    BoardEnergySample board;
+    board.available = true;
+    board.joules    = 1000.0; // 200 prefill + 400 decode + 4 idle seconds at 95 W + 20 unexplained
+    board.idle_watts = 95.0;
+    const ThroughputReport metered =
+        make_throughput_report(energy_before, energy_after, 10.0, board);
+    failures += check(metered.energy.available && metered.energy.board_joules == 1000.0 &&
+                          metered.energy.prefill_joules == 200.0 &&
+                          metered.energy.decode_joules == 400.0 &&
+                          metered.energy.accounted_seconds == 6.0 &&
+                          metered.energy.idle_joules == 380.0 &&
+                          metered.energy.residual_joules == 20.0 &&
+                          std::abs(metered.energy.residual_fraction - 0.02) < 1e-12,
+                      "interval energy reconciliation mismatch");
+
+    const Json metered_json = Json::parse(format_throughput_json("serve-test", 5000, metered));
+    // Each phase divides by its own denominator. Dividing prefill energy by every token, or decode
+    // energy by prompt tokens, would produce a plausible number that means nothing.
+    failures += check(
+        metered_json.at("energy").at("board_joules") == 1000.0 &&
+            metered_json.at("energy").at("idle_watts") == 95.0 &&
+            std::abs(static_cast<double>(
+                         metered_json.at("energy").at("joules_per_token").at("prefill")) -
+                     0.2) < 1e-12 &&
+            std::abs(static_cast<double>(
+                         metered_json.at("energy").at("joules_per_token").at("decode")) -
+                     4.0) < 1e-12 &&
+            std::abs(static_cast<double>(
+                         metered_json.at("energy").at("joules_per_token").at("served")) -
+                     1000.0 / 1100.0) < 1e-12 &&
+            std::abs(static_cast<double>(
+                         metered_json.at("energy").at("joules_per_token").at("active")) -
+                     620.0 / 1100.0) < 1e-12,
+        "throughput energy json mismatch");
+
+    // A phase that produced no tokens has no denominator. Null distinguishes that from free.
+    ninfer::RuntimeStats decode_only_after = energy_after;
+    decode_only_after.computed_prefill_tokens = 0;
+    decode_only_after.prefill_energy_joules   = 0.0;
+    const Json decode_only_json = Json::parse(format_throughput_json(
+        "serve-test", 5000, make_throughput_report(energy_before, decode_only_after, 10.0, board)));
+    failures +=
+        check(decode_only_json.at("energy").at("joules_per_token").at("prefill").is_null(),
+              "energy per token must be null for a phase that produced no tokens");
+
+    // A driver reload restarts the board counter. The reporter drops that difference rather than
+    // passing a negative or restarted value through, so an unavailable sample must stay absent.
+    const ThroughputReport unmetered =
+        make_throughput_report(energy_before, energy_after, 10.0, BoardEnergySample{});
+    failures += check(!unmetered.energy.available && unmetered.energy.board_joules == 0.0,
+                      "energy must stay absent without a usable board sample");
 
     ninfer::RuntimeStats continuation_before;
     ninfer::RuntimeStats continuation_after;
