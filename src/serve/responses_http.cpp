@@ -290,6 +290,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 output.on_content = [&](const std::string& text) {
                     write_stream_items(sink, *stream, stream->encoder->content_delta(text));
                 };
+                output.on_prompt_progress = [&](const ninfer::PromptProgress& progress) {
+                    write_stream_items(sink, *stream, stream->encoder->prompt_progress(progress));
+                };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());

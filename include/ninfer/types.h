@@ -422,10 +422,22 @@ struct OutputDelta {
     std::string text;
 };
 
+// Prefill produces no output, so a long prompt leaves a streaming transport
+// with nothing to send for the whole computation. This carries the one fact a
+// client can act on while it waits.
+struct PromptProgress {
+    std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+};
+
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+    // Only transports that keep a socket open while the prompt is computed
+    // have anywhere to put this, so it defaults to discarding it.
+    virtual void publish_prompt_progress(PromptProgress /*progress*/) {}
 };
 
 class CancellationView {

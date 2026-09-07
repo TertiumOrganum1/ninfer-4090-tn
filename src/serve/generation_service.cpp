@@ -232,6 +232,10 @@ public:
         }
     }
 
+    void publish_prompt_progress(ninfer::PromptProgress progress) override {
+        if (sink_->on_prompt_progress) { sink_->on_prompt_progress(progress); }
+    }
+
     std::size_t finish(bool is_tool_call_response) {
         if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
         return content_bytes_;

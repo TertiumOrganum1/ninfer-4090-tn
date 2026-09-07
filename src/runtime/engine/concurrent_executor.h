@@ -1173,6 +1173,10 @@ private:
 
         std::exception_ptr caller_error;
         std::vector<OutputDelta> events;
+        // Prefill of a long prompt can run for minutes without producing a
+        // token. Reporting each chunk boundary keeps the caller informed and
+        // keeps a streaming transport from looking dead to its client.
+        std::optional<std::uint32_t> reported_prefill;
         for (;;) {
             events.clear();
             bool done = false;
@@ -1191,6 +1195,26 @@ private:
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
                     queue_cv_.notify_one();
+                }
+            }
+
+            if (caller_error == nullptr && sink != nullptr) {
+                const std::uint32_t processed =
+                    request->prefill_processed.load(std::memory_order_relaxed);
+                if (reported_prefill != processed) {
+                    reported_prefill = processed;
+                    try {
+                        sink->publish_prompt_progress(PromptProgress{
+                            .processed_prompt_tokens = processed,
+                            .prompt_tokens           = request->prompt_summary.prompt_tokens,
+                            .reused_prompt_tokens =
+                                request->prefill_reused.load(std::memory_order_relaxed),
+                        });
+                    } catch (...) {
+                        caller_error = std::current_exception();
+                        request->cancelled.store(true, std::memory_order_release);
+                        queue_cv_.notify_one();
+                    }
                 }
             }
 
@@ -1272,6 +1296,11 @@ private:
         std::optional<Clock::time_point> admitted;
         double publish_seconds = 0.0;
         std::optional<Clock::time_point> first_token;
+        // Written by the worker at each prefill chunk boundary, read by the
+        // waiting consumer thread. Relaxed: these only drive progress
+        // reporting, and the completion handshake already orders the result.
+        std::atomic<std::uint32_t> prefill_processed{0};
+        std::atomic<std::uint32_t> prefill_reused{0};
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
         std::vector<TokenId> generated;
@@ -2051,6 +2080,10 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->prefill_processed.fetch_add(step.processed_prompt_tokens,
+                                             std::memory_order_relaxed);
+        request->prefill_reused.store(step.summary.reused_prompt_tokens,
+                                      std::memory_order_relaxed);
         consume_service_work(request, 1);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (continuation_cache_ && request->options.execution.allow_prefix_reuse && request->lane &&

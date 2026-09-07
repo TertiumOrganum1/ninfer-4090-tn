@@ -1258,6 +1258,23 @@ std::vector<std::string> ResponsesEventStream::start() {
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
 
+// Repeats response.in_progress, the one event the schema already defines for
+// "accepted, still working", carrying the prefill counters alongside it. A
+// client that does not know the field ignores it and still sees the stream
+// stay alive; one that does can show the wait it is actually in.
+std::vector<std::string> ResponsesEventStream::prompt_progress(
+    const ninfer::PromptProgress& progress) {
+    if (!impl_->started || impl_->finish_built) { return {}; }
+    Json payload{
+        {"response",
+         in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime)},
+        {"prompt_progress",
+         Json{{"processed", progress.processed_prompt_tokens},
+              {"total", progress.prompt_tokens},
+              {"cache", progress.reused_prompt_tokens}}}};
+    return {sse(impl_->event("response.in_progress", std::move(payload)))};
+}
+
 std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid reasoning delta event state");

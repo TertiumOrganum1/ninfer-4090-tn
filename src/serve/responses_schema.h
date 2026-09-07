@@ -4,6 +4,7 @@
 // translation, terminal response objects, and semantic SSE events. Engine and
 // transport concerns remain outside this file.
 
+#include "ninfer/types.h"
 #include "serve/request.h"
 
 #include <nlohmann/json.hpp>
@@ -93,6 +94,7 @@ public:
     ResponsesEventStream& operator=(const ResponsesEventStream&) = delete;
 
     std::vector<std::string> start();
+    std::vector<std::string> prompt_progress(const ninfer::PromptProgress& progress);
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);

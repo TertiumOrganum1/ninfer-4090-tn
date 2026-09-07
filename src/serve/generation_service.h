@@ -66,6 +66,7 @@ struct GenerationOutcome {
 struct StreamSink {
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(const ninfer::PromptProgress& progress)> on_prompt_progress;
     std::function<bool()> is_cancelled;
 };
 
