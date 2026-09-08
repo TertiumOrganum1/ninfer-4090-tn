@@ -82,7 +82,7 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
     return true;
 }
 
-bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+bool parse_xml_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
     constexpr std::string_view kFunctionOpen  = "<function=";
     constexpr std::string_view kFunctionClose = "</function>";
     std::size_t pos                           = 0;
@@ -114,6 +114,46 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
     out.name           = name;
     out.arguments_json = args.dump();
     return true;
+}
+
+// Qwen3 weights are trained on the Hermes convention, so the model emits a JSON
+// body inside <tool_call> even when the prompt teaches the XML dialect above.
+// Accepting only XML turned those calls back into prose, which reads to a client
+// as a turn that ended without calling anything.
+bool parse_hermes_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+    const Json parsed = Json::parse(trim_ascii(block), nullptr, false);
+    if (!parsed.is_object()) { return false; }
+
+    const auto name_field = parsed.find("name");
+    if (name_field == parsed.end() || !name_field->is_string()) { return false; }
+    const std::string name = name_field->get<std::string>();
+    if (!valid_function_name(name, max_name_length)) { return false; }
+
+    Json args                  = Json::object();
+    const auto arguments_field = parsed.find("arguments");
+    if (arguments_field != parsed.end() && !arguments_field->is_null()) {
+        if (arguments_field->is_object()) {
+            args = *arguments_field;
+        } else if (arguments_field->is_string()) {
+            // Double-encoded arguments: the object arrives as a JSON string.
+            args = Json::parse(arguments_field->get<std::string>(), nullptr, false);
+            if (!args.is_object()) { return false; }
+        } else {
+            return false;
+        }
+    }
+
+    out.id             = new_tool_call_id();
+    out.name           = name;
+    out.arguments_json = args.dump();
+    return true;
+}
+
+// Both dialects are all-or-nothing and write to `out` only once they have
+// committed, so trying one after the other cannot leave a half-filled call.
+bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+    return parse_xml_tool_call(block, max_name_length, out) ||
+           parse_hermes_tool_call(block, max_name_length, out);
 }
 
 ParsedToolCallOutput fallback(const std::string& text) {

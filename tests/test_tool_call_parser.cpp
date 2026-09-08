@@ -66,6 +66,109 @@ int test_multiple_calls_and_json_values() {
     return failures;
 }
 
+int test_hermes_json_call() {
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("Calling weather.\n"
+                                                   "<tool_call>\n"
+                                                   "{\"name\": \"get_weather\", \"arguments\": "
+                                                   "{\"city\": \"Paris\", \"days\": 2}}\n"
+                                                   "</tool_call>",
+                                                   64);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "hermes call parsed as tool response");
+    failures += check(parsed.content == "Calling weather.", "hermes content prefix trimmed");
+    failures += check(parsed.tool_calls.size() == 1, "one parsed hermes call");
+    if (parsed.tool_calls.size() != 1) { return failures; }
+    failures += check(parsed.tool_calls[0].id.rfind("call_", 0) == 0, "hermes call id prefix");
+    failures += check(parsed.tool_calls[0].name == "get_weather", "hermes function name parsed");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("city") == "Paris", "hermes string argument parsed");
+    failures += check(args.at("days") == 2, "hermes number argument parsed");
+    return failures;
+}
+
+// The two dialects are chosen per call by the model, not per response, so a
+// single turn can legitimately mix them.
+int test_hermes_and_xml_mix() {
+    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n{\"name\":\"first\",\"arguments\":{\"value\":1}}\n</tool_call>\n"
+        "<tool_call>\n<function=second>\n<parameter=value>\n2\n</parameter>\n</function>\n"
+        "</tool_call>",
+        64);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "mixed dialects parsed as tool response");
+    failures += check(parsed.tool_calls.size() == 2, "two parsed mixed calls");
+    if (parsed.tool_calls.size() != 2) { return failures; }
+    failures += check(parsed.tool_calls[0].name == "first", "mixed first call name");
+    failures += check(parsed.tool_calls[1].name == "second", "mixed second call name");
+    failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("value") == 1,
+                      "mixed hermes argument");
+    failures += check(Json::parse(parsed.tool_calls[1].arguments_json).at("value") == 2,
+                      "mixed xml parameter");
+    return failures;
+}
+
+int test_hermes_argument_shapes() {
+    const ninfer::serve::ParsedToolCallOutput encoded = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n{\"name\":\"call\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n"
+        "</tool_call>",
+        64);
+    const ninfer::serve::ParsedToolCallOutput absent = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n{\"name\":\"ping\"}\n</tool_call>", 64);
+    const ninfer::serve::ParsedToolCallOutput null_args =
+        ninfer::serve::parse_qwen_tool_call_output(
+            "<tool_call>\n{\"name\":\"ping\",\"arguments\":null}\n</tool_call>", 64);
+
+    int failures = 0;
+    failures += check(encoded.is_tool_call_response && encoded.tool_calls.size() == 1 &&
+                          Json::parse(encoded.tool_calls[0].arguments_json).at("city") == "Paris",
+                      "double-encoded arguments string decoded");
+    failures += check(absent.is_tool_call_response && absent.tool_calls.size() == 1 &&
+                          absent.tool_calls[0].arguments_json == "{}",
+                      "absent arguments become an empty object");
+    failures += check(null_args.is_tool_call_response && null_args.tool_calls.size() == 1 &&
+                          null_args.tool_calls[0].arguments_json == "{}",
+                      "null arguments become an empty object");
+    return failures;
+}
+
+// Fallback has to stay total: the streaming filter replays the buffered region
+// verbatim, so anything the parser rejects must survive as the original bytes.
+int test_hermes_rejections_fall_back_to_text() {
+    int failures = 0;
+    for (const char* text : {
+             "<tool_call>\n{\"name\":\"get_weather\",\"argum",
+             "<tool_call>\n[\"get_weather\"]\n</tool_call>",
+             "<tool_call>\n{\"arguments\":{}}\n</tool_call>",
+             "<tool_call>\n{\"name\":\"bad name!\",\"arguments\":{}}\n</tool_call>",
+             "<tool_call>\n{\"name\":\"ok\",\"arguments\":[1,2]}\n</tool_call>",
+             "<tool_call>\n{\"name\":\"ok\",\"arguments\":{}} tail\n</tool_call>",
+         }) {
+        const ninfer::serve::ParsedToolCallOutput parsed =
+            ninfer::serve::parse_qwen_tool_call_output(text, 64);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                              parsed.content == text,
+                          std::string("rejected hermes body preserved verbatim: ") + text);
+    }
+    return failures;
+}
+
+int test_hermes_honours_name_limit() {
+    const std::string text =
+        "<tool_call>\n{\"name\":\"" + std::string(128, 'a') + "\",\"arguments\":{}}\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput anthropic =
+        ninfer::serve::parse_qwen_tool_call_output(text, 128);
+    const ninfer::serve::ParsedToolCallOutput openai =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+
+    int failures = 0;
+    failures += check(anthropic.is_tool_call_response, "hermes 128-character name accepted at 128");
+    failures += check(!openai.is_tool_call_response, "hermes 128-character name rejected at 64");
+    return failures;
+}
+
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
@@ -157,6 +260,11 @@ int main() {
     int failures = 0;
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
+    failures += test_hermes_json_call();
+    failures += test_hermes_and_xml_mix();
+    failures += test_hermes_argument_shapes();
+    failures += test_hermes_rejections_fall_back_to_text();
+    failures += test_hermes_honours_name_limit();
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();
