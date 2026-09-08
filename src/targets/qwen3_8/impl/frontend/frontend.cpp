@@ -36,6 +36,7 @@ namespace fi = frontend_internal;
 
 constexpr std::size_t kPatchFeatures   = 1536;
 constexpr std::string_view kThinkClose = "</think>";
+constexpr std::string_view kToolOpen   = "<tool_call>";
 constexpr double kRescaleFactor        = 1.0 / 255.0;
 constexpr double kVideoFps             = 2.0;
 constexpr int kVideoMinFrames          = 4;
@@ -543,7 +544,24 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
+    // A tool call opened inside reasoning is withheld rather than published.
+    // Only the end of the generation says which it was: if </think> still
+    // arrives, the branch above flushes this region as the reasoning it always
+    // was, and if it never does, `terminalize` hands it to content where the
+    // tool parser can see it. Publishing eagerly would forfeit that choice,
+    // because a reasoning delta is on the wire the moment it is appended.
+    const std::size_t tool = state.think_marker_pending.find(kToolOpen);
+    if (tool != std::string::npos) {
+        feed_channel(state, OutputChannel::Reasoning,
+                     std::string_view(state.think_marker_pending).substr(0, tool), policy, emitted,
+                     committed_tokens, best_match);
+        state.think_marker_pending.erase(0, tool);
+        return;
+    }
+
+    const std::size_t hold =
+        std::max(longest_suffix_prefix(state.think_marker_pending, kThinkClose, true),
+                 longest_suffix_prefix(state.think_marker_pending, kToolOpen, true));
     const std::size_t safe = state.think_marker_pending.size() - hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
@@ -572,10 +590,22 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
-        feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
-                     committed_tokens, nullptr);
+        // The block never closed. A withheld tool region is then a call the
+        // model made without terminating its thought, not a thought about a
+        // call, so it belongs on the content channel where it can be parsed;
+        // anything else is reasoning that simply ran out of generation.
+        std::string held = std::move(state.think_marker_pending);
         state.think_marker_pending.clear();
-        close_channel(state, OutputChannel::Reasoning, emitted);
+        if (held.rfind(kToolOpen, 0) == 0) {
+            close_channel(state, OutputChannel::Reasoning, emitted);
+            state.in_reasoning = false;
+            feed_content(state, std::move(held), policy, emitted, committed_tokens, nullptr);
+            close_channel(state, OutputChannel::Content, emitted);
+        } else {
+            feed_channel(state, OutputChannel::Reasoning, held, policy, emitted, committed_tokens,
+                         nullptr);
+            close_channel(state, OutputChannel::Reasoning, emitted);
+        }
     } else {
         close_channel(state, OutputChannel::Content, emitted);
     }

@@ -91,15 +91,28 @@ nlohmann::json decoder_added(std::string content, bool special = false) {
 FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
-    const nlohmann::json tokens = nlohmann::json::array(
-        {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
-         added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
-         added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
-         added(33, "system\n"),
-         added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
-         added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
-         added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
-         added(248068, "<think>"), added(248069, "</think>")});
+    const nlohmann::json tokens =
+        nlohmann::json::array({added(1, "helloST"),
+                               added(2, "OPtail"),
+                               added(3, "thought</thi"),
+                               added(4, "nk>\n\nanswer"),
+                               added(6, "<eos>", true),
+                               added(7, "<0.0 seconds>"),
+                               added(30, "user\n"),
+                               added(31, "assistant\n"),
+                               added(32, "\n"),
+                               added(33, "system\n"),
+                               added(40, "plan<tool_"),
+                               added(41, "call>\n{\"name\":\"go\",\"arguments\":{}}\n</tool_call>"),
+                               added(42, "</think>\n\ndone"),
+                               added(248045, "<|im_start|>", true),
+                               added(248046, "<|im_end|>", true),
+                               added(248053, "<|vision_start|>", true),
+                               added(248054, "<|vision_end|>", true),
+                               added(248056, "<|image_pad|>", true),
+                               added(248057, "<|video_pad|>", true),
+                               added(248068, "<think>"),
+                               added(248069, "</think>")});
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
@@ -920,6 +933,70 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+ninfer::PromptInput thinking_prompt_input() {
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    return input;
+}
+
+constexpr std::string_view kToolRegion =
+    "<tool_call>\n{\"name\":\"go\",\"arguments\":{}}\n</tool_call>";
+
+// A reasoning delta is on the wire as soon as it is appended, so the tool
+// region has to be withheld until the end of the generation decides what it
+// was. Publishing it as reasoning would make the call unrecoverable.
+int test_unclosed_thinking_tool_call_becomes_content(const Frontend& frontend) {
+    auto prompt  = frontend.prepare(thinking_prompt_input());
+    auto session = frontend.make_output_session(prompt, {});
+
+    const auto opened =
+        session.preview(std::array<ninfer::TokenId, 1>{40}, 2, ninfer::FinishReason::OutputLimit);
+    int failures    = check(opened.accepted_tokens == 1 && !opened.finished(),
+                            "opening the tool region ended generation early");
+    const auto held = session.commit_preview();
+    failures += check(channel_text(held, ninfer::OutputChannel::Reasoning) == "plan",
+                      "reasoning before the tool marker was not published");
+    failures += check(channel_text(held, ninfer::OutputChannel::Content).empty(),
+                      "a partial tool marker was published before its outcome was known");
+
+    const auto closed =
+        session.preview(std::array<ninfer::TokenId, 1>{41}, 1, ninfer::FinishReason::OutputLimit);
+    failures += check(closed.accepted_tokens == 1 && closed.finished(),
+                      "the tool region did not finish at the token limit");
+    const auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning).empty(),
+                      "the withheld tool region leaked onto the reasoning channel");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == kToolRegion,
+                      "an unclosed thought did not hand its tool call to the content channel");
+    return failures;
+}
+
+// The mirror case, and the reason the region is held rather than promoted on
+// sight: a model that merely writes about a call and then closes its thought
+// must keep every byte of it as reasoning.
+int test_closed_thinking_keeps_tool_call_as_reasoning(const Frontend& frontend) {
+    auto prompt  = frontend.prepare(thinking_prompt_input());
+    auto session = frontend.make_output_session(prompt, {});
+
+    const std::array<ninfer::TokenId, 3> tokens{40, 41, 42};
+    const auto decision = session.preview(tokens, 3, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 3 && decision.finished(),
+                                "closed thinking did not finish at the token limit");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) ==
+                          std::string("plan") + std::string(kToolRegion),
+                      "a closed thought did not keep its tool region as reasoning");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "done",
+                      "content after a closed thought was lost");
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1002,6 +1079,8 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_unclosed_thinking_tool_call_becomes_content(frontend);
+    failures += test_closed_thinking_keeps_tool_call_as_reasoning(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
