@@ -45,6 +45,7 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    RepetitionGuardOptions repetition_guard;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     ContinuationCacheOptions continuation_cache;
     std::uint32_t vision_max_tokens = 8192;

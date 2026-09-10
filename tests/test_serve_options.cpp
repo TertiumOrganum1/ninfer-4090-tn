@@ -161,6 +161,24 @@ int main() {
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
     failures +=
+        check(configured.repetition_guard.enabled, "the repetition guard was not on by default");
+
+    // Disabling is what a reference comparison needs, since a terminated cycle is a behavioral
+    // difference from an engine that has no guard.
+    const ServeOptions unguarded = parse({"ninfer-serve", "model.ninfer", "--no-repetition-guard"});
+    failures += check(!unguarded.repetition_guard.enabled,
+                      "--no-repetition-guard did not reach serving options");
+
+    const ServeOptions tuned =
+        parse({"ninfer-serve", "model.ninfer", "--repetition-guard-window", "1024",
+               "--repetition-guard-ngram", "12", "--repetition-guard-cycles", "5",
+               "--repetition-guard-min-tokens", "96"});
+    failures +=
+        check(tuned.repetition_guard.enabled && tuned.repetition_guard.window == 1024 &&
+                  tuned.repetition_guard.ngram == 12 && tuned.repetition_guard.cycles == 5 &&
+                  tuned.repetition_guard.min_tokens == 96,
+              "repetition guard thresholds did not reach serving options");
+    failures +=
         check(configured.prefix_checkpoint_policy == ninfer::PrefixCheckpointPolicy::StableTurn,
               "stable turn checkpoint policy did not reach serving options");
     failures +=

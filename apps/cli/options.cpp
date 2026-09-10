@@ -122,6 +122,9 @@ std::string usage_text(const char* argv0) {
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
            "       [--lora-dir DIR] [--lora-slots N] [--lora-rank N] [--adapter NAME]\n"
            "       [--no-cuda-graph] [--prefix-checkpoint-policy stable-turn|rolling-tool]\n"
+           "       [--no-repetition-guard] [--repetition-guard-window N]\n"
+           "       [--repetition-guard-ngram N] [--repetition-guard-cycles N]\n"
+           "       [--repetition-guard-min-tokens N]\n"
            "       [--continuation-cache off|l1|l1-l2|l1-l2-l3] "
            "[--continuation-cache-policy adaptive]\n"
            "       [--continuation-cache-dir DIR] [--continuation-cache-namespace NAME]\n"
@@ -143,15 +146,15 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "--prefix-checkpoint-policy defaults to rolling-tool.\n"
-            "Continuation cache defaults to off for one-shot inference. Explicit cache tuning "
-            "enables l1-l2, or l1-l2-l3 when --continuation-cache-dir is set.\n"
+           "Continuation cache defaults to off for one-shot inference. Explicit cache tuning "
+           "enables l1-l2, or l1-l2-l3 when --continuation-cache-dir is set.\n"
            "L1/L2/L3 capacities default to 768/16384/49152 MiB; adaptive policy and namespace "
            "local are defaults.\n"
-            "L1/L2/L3 idle TTLs default to 600/7200/86400 seconds (0 means no expiry).\n"
-            "Persistence defaults to 60 seconds or 8192 tokens; interval 0 disables only the "
-            "timer trigger; token growth and orderly shutdown still persist.\n"
-            "Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
-            "MiB; checkpoint history defaults to 4.\n"
+           "L1/L2/L3 idle TTLs default to 600/7200/86400 seconds (0 means no expiry).\n"
+           "Persistence defaults to 60 seconds or 8192 tokens; interval 0 disables only the "
+           "timer trigger; token growth and orderly shutdown still persist.\n"
+           "Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
+           "MiB; checkpoint history defaults to 4.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -229,6 +232,19 @@ Options parse_options(int argc, char** argv) {
             if (options.adapter.empty()) {
                 throw std::invalid_argument("--adapter must name a pool adapter");
             }
+        } else if (arg == "--no-repetition-guard") {
+            options.repetition_guard.enabled = false;
+        } else if (arg == "--repetition-guard-window") {
+            options.repetition_guard.window =
+                parse_u32(value(arg), "repetition-guard-window", false);
+        } else if (arg == "--repetition-guard-ngram") {
+            options.repetition_guard.ngram = parse_u32(value(arg), "repetition-guard-ngram", false);
+        } else if (arg == "--repetition-guard-cycles") {
+            options.repetition_guard.cycles =
+                parse_u32(value(arg), "repetition-guard-cycles", false);
+        } else if (arg == "--repetition-guard-min-tokens") {
+            options.repetition_guard.min_tokens =
+                parse_u32(value(arg), "repetition-guard-min-tokens", true);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--prefix-checkpoint-policy") {

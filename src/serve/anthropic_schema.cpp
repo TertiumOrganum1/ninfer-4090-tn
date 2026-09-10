@@ -525,6 +525,7 @@ const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_call
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
+    case ninfer::FinishReason::RepetitionCycle:
         return "max_tokens";
     case ninfer::FinishReason::None:
     case ninfer::FinishReason::StopToken:

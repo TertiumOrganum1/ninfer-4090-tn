@@ -67,6 +67,7 @@ ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_repetition_guard_test SOURCES test_repetition_guard.cpp)
 ninfer_add_test(ninfer_l1_retention_policy_test SOURCES test_l1_retention_policy.cpp)
 ninfer_add_test(ninfer_stable_prefix_flights_test
   SOURCES test_stable_prefix_flights.cpp

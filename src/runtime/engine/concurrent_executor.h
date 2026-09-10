@@ -12,6 +12,7 @@
 #include "runtime/engine/request_memory.h"
 #include "runtime/engine/stable_prefix_flights.h"
 #include "runtime/generation/generation_budget.h"
+#include "runtime/generation/repetition_guard.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/frontend.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/prepared_prompt.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/runtime.h"
@@ -75,17 +76,16 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           auto_save_evicted_(options.auto_save_evicted),
+          repetition_guard_(options.repetition_guard),
           admission_capacity_(instance.program->admission_capacity()),
           prefill_decode_balance_(options.prefill_decode_balance),
           continuation_cache_(make_continuation_cache(options.continuation_cache)),
           l1_policy_active_(options.continuation_cache.tiers != ContinuationCacheTiers::Off),
-          l1_byte_budget_(mib_to_bytes(options.continuation_cache.l1_capacity_mib,
-                                       "continuation L1 capacity")),
+          l1_byte_budget_(
+              mib_to_bytes(options.continuation_cache.l1_capacity_mib, "continuation L1 capacity")),
           l1_idle_ttl_(std::chrono::seconds(options.continuation_cache.l1_idle_ttl_seconds)),
-          publication_l2_ttl_(std::chrono::seconds(
-              options.continuation_cache.l2_idle_ttl_seconds)),
-          publication_l3_ttl_(std::chrono::seconds(
-              options.continuation_cache.l3_idle_ttl_seconds)),
+          publication_l2_ttl_(std::chrono::seconds(options.continuation_cache.l2_idle_ttl_seconds)),
+          publication_l3_ttl_(std::chrono::seconds(options.continuation_cache.l3_idle_ttl_seconds)),
           power_meter_(options.device) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -1302,6 +1302,9 @@ private:
         std::atomic<std::uint32_t> prefill_processed{0};
         std::atomic<std::uint32_t> prefill_reused{0};
         std::optional<GenerationBudget> budget;
+        // Absent when the guard is disabled. Trips between rounds rather than inside one, so a
+        // confirmed cycle costs at most one further round before the lane is terminated.
+        std::optional<RepetitionGuard> repetition;
         std::optional<BeginSummary> begin;
         std::vector<TokenId> generated;
         std::string content;
@@ -1903,6 +1906,7 @@ private:
         request->generated.push_back(token);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
+        if (request->repetition) { (void)request->repetition->observe(std::span(&token, 1)); }
         auto published = request->output.commit_preview();
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published));
@@ -2799,6 +2803,7 @@ private:
         try {
             request->budget.emplace(summary.effective_output_tokens,
                                     summary.effective_limit_reason);
+            if (repetition_guard_.enabled) { request->repetition.emplace(repetition_guard_); }
             request->generated.reserve(summary.effective_output_tokens);
             const auto admitted_at          = Clock::now();
             request->lane                   = lane;
@@ -3138,8 +3143,14 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
+            // A tripped guard ends the request, but the row still has to commit a licensed
+            // prefix: only a cancelled row may commit nothing. Licensing the round against its
+            // own extent makes the decoder terminalize here exactly as an exhausted budget does,
+            // and a stop token inside the round still wins and reports itself.
+            const bool repeating = request->repetition && request->repetition->tripped();
             const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                row_tokens, repeating ? count : request->budget->remaining(),
+                repeating ? FinishReason::RepetitionCycle : request->budget->limit_reason());
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                 (!decision.finished() && decision.accepted_tokens != count)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
@@ -3163,6 +3174,7 @@ private:
                 request->generated.insert(request->generated.end(), row_tokens.begin(),
                                           row_tokens.end());
                 request->budget->commit(accepted[row]);
+                if (request->repetition) { (void)request->repetition->observe(row_tokens); }
                 consume_service_work(request, accepted[row]);
             }
             auto published = request->output.commit_preview();
@@ -3349,6 +3361,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool auto_save_evicted_;
+    const RepetitionGuardOptions repetition_guard_;
     const AdmissionResources admission_capacity_;
     std::unique_ptr<cache::ContinuationCache> continuation_cache_;
     // Off preserves historical unmanaged same-lane prefix reuse. Every active tier applies this

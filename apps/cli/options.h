@@ -25,6 +25,7 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    RepetitionGuardOptions repetition_guard;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     ContinuationCacheOptions continuation_cache{.tiers = ContinuationCacheTiers::Off};
     std::uint32_t vision_max_tokens = 8192;

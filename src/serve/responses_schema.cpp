@@ -916,6 +916,7 @@ std::string response_status(ninfer::FinishReason reason) {
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
+    case ninfer::FinishReason::RepetitionCycle:
         return "incomplete";
     case ninfer::FinishReason::Cancelled:
         return "cancelled";

@@ -291,6 +291,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.lora                 = options_.lora;
     engine_options.speculative          = options_.speculative;
+    engine_options.repetition_guard         = options_.repetition_guard;
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();

@@ -154,6 +154,8 @@ std::string format_finish(ninfer::FinishReason reason) {
         return "stop-string";
     case ninfer::FinishReason::Cancelled:
         return "cancelled";
+    case ninfer::FinishReason::RepetitionCycle:
+        return "repetition-cycle";
     }
     return "unknown";
 }
@@ -382,6 +384,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.speculative    = cli.speculative;
+        engine_options.repetition_guard         = cli.repetition_guard;
         engine_options.prefix_checkpoint_policy = cli.prefix_checkpoint_policy;
         engine_options.continuation_cache = cli.continuation_cache;
         engine_options.vision_max_tokens = cli.vision_max_tokens;

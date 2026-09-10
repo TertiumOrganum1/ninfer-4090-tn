@@ -100,6 +100,8 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
         return "stop_string";
     case ninfer::FinishReason::Cancelled:
         return "cancelled";
+    case ninfer::FinishReason::RepetitionCycle:
+        return "repetition_cycle";
     }
     return "unknown";
 }

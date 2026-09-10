@@ -132,6 +132,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--continuation-cache-persist-min-tokens N] "
            "[--continuation-cache-filesystem-reserve-mib N] [--prefix-checkpoint-history N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--no-repetition-guard] [--repetition-guard-window N] "
+           "[--repetition-guard-ngram N] [--repetition-guard-cycles N] "
+           "[--repetition-guard-min-tokens N] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -171,10 +174,10 @@ std::string serve_usage_text(const char* argv0) {
            "with --continuation-cache-dir; l1-l2-l3 requires a nonempty directory\n"
            "       l1/l2/l3 capacities default to 768/16384/49152 MiB; policy defaults to "
            "adaptive; namespace defaults to local\n"
-            "       L1/L2/L3 idle TTLs default to 600/7200/86400 seconds (0 means no expiry).\n"
-            "       Persistence defaults to 60 seconds or 8192 tokens; interval 0 disables only "
-            "the timer trigger; token growth and orderly shutdown still persist\n"
-            "       Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
+           "       L1/L2/L3 idle TTLs default to 600/7200/86400 seconds (0 means no expiry).\n"
+           "       Persistence defaults to 60 seconds or 8192 tokens; interval 0 disables only "
+           "the timer trigger; token growth and orderly shutdown still persist\n"
+           "       Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
            "MiB; prefix checkpoint history defaults "
            "to 4\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -330,6 +333,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const int val = parse_nonnegative_int(require_value("--lora-rank"), "lora-rank");
             if (val <= 0) { throw std::invalid_argument("--lora-rank must be positive"); }
             options.lora.rank_ceiling = static_cast<std::int32_t>(val);
+        } else if (arg == "--no-repetition-guard") {
+            options.repetition_guard.enabled = false;
+        } else if (arg == "--repetition-guard-window") {
+            options.repetition_guard.window = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--repetition-guard-window"), "repetition-guard-window"));
+        } else if (arg == "--repetition-guard-ngram") {
+            options.repetition_guard.ngram = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--repetition-guard-ngram"), "repetition-guard-ngram"));
+        } else if (arg == "--repetition-guard-cycles") {
+            options.repetition_guard.cycles = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--repetition-guard-cycles"), "repetition-guard-cycles"));
+        } else if (arg == "--repetition-guard-min-tokens") {
+            options.repetition_guard.min_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--repetition-guard-min-tokens"), "repetition-guard-min-tokens"));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

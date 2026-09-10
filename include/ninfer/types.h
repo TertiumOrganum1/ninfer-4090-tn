@@ -67,6 +67,24 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
 };
 
+// Terminates a generation that has locked into a repeating token cycle. A failed tool call often
+// leaves a model narrating its next step, reading that narration back, and emitting it again; the
+// cycle then runs to the output limit. The guard observes committed tokens only and never changes
+// the sampled distribution, so a generation that does not loop is bit-identical to one produced
+// without it.
+struct RepetitionGuardOptions {
+    bool enabled = true;
+    // How far back a repeat may reach, in committed tokens. Also bounds the detectable period.
+    std::uint32_t window = 512;
+    // Length of the token n-gram whose recurrence proposes a period.
+    std::uint32_t ngram = 24;
+    // Full periods that must be confirmed before the cycle counts as locked.
+    std::uint32_t cycles = 3;
+    // Confirmed tokens required regardless of period, so a short period needs a long run. This is
+    // what keeps a divider rule or a repeated indent from tripping a period-1 match.
+    std::uint32_t min_tokens = 64;
+};
+
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
@@ -180,6 +198,7 @@ struct EngineOptions {
     std::function<void(const SlotAutoSaveEvent&)> auto_save_listener;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    RepetitionGuardOptions repetition_guard;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     ContinuationCacheOptions continuation_cache;
     std::uint32_t vision_max_tokens = 8192;
@@ -415,6 +434,7 @@ enum class FinishReason : std::uint8_t {
     StopToken,
     StopString,
     Cancelled,
+    RepetitionCycle,
 };
 
 struct OutputDelta {

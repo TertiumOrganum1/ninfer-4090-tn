@@ -252,6 +252,9 @@ const char* finish_reason_wire(ninfer::FinishReason reason) {
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
+    // The guard truncates the generation, and "length" is the only finish_reason OpenAI defines
+    // for a server-side cut. The exact cause is reported in the request log.
+    case ninfer::FinishReason::RepetitionCycle:
         return "length";
     case ninfer::FinishReason::None:
     case ninfer::FinishReason::StopToken:

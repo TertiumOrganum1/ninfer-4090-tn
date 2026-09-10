@@ -591,6 +591,11 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--prefix-checkpoint-history N` | IDs retained per mutable session alias, including current head | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--no-repetition-guard` | let a generation that has locked into a repeating cycle run to its output limit | guard on |
+| `--repetition-guard-window N` | how far back a repeat may reach, which also bounds the detectable period | `512` |
+| `--repetition-guard-ngram N` | token n-gram whose recurrence proposes a period | `24` |
+| `--repetition-guard-cycles N` | whole periods confirmed before the cycle counts as locked | `3` |
+| `--repetition-guard-min-tokens N` | confirmed tokens required regardless of period | `64` |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
@@ -784,6 +789,24 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 There is no admission ETA or unbounded overflow queue.
+
+### Repetition guard
+
+A generation that locks into a repeating token cycle otherwise runs to its output-token limit. The
+guard watches each request's committed tokens: a recurring n-gram proposes a period, the period is
+then confirmed token by token against history, and the request is terminated once the confirmed run
+covers `--repetition-guard-cycles` whole periods and at least `--repetition-guard-min-tokens`
+tokens. Speculative drafts that were proposed and rejected are never observed, and no logits are
+read, so a generation that does not lock into a cycle is unchanged by the guard being enabled.
+
+Termination is reported as a server-side truncation in each protocol's own vocabulary, because none
+of the three defines a repetition reason: Chat Completions returns `finish_reason: "length"`,
+Responses returns `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"`, and
+Anthropic Messages returns `stop_reason: "max_tokens"`. The exact cause appears only in the
+structured request log, as `finish_reason: "repetition_cycle"`.
+
+Disable it with `--no-repetition-guard` when comparing against a reference implementation, since a
+terminated cycle is a behavioral difference from an engine that has no guard.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
