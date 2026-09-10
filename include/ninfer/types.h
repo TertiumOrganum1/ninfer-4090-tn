@@ -422,6 +422,15 @@ private:
     RequestErrorKind kind_;
 };
 
+// A fault that invalidates the generation round in flight and nothing beyond it. A licensed
+// prefix disagreeing with the state that produced it says nothing about the device, the
+// scheduler, or the next round, so the executor fails the requests that round was serving and
+// keeps accepting work. Every other exception escaping the worker loop retires the engine.
+class RoundFault final : public std::logic_error {
+public:
+    explicit RoundFault(std::string message) : std::logic_error(std::move(message)) {}
+};
+
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
@@ -722,6 +731,9 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds                      = 0;
     std::uint64_t decode_row_rounds                  = 0;
+    // Rounds abandoned to a RoundFault, failing the requests they served without retiring the
+    // engine. Any sustained rate here is a generation-state bug, not a client problem.
+    std::uint64_t decode_rounds_abandoned            = 0;
     std::uint64_t continuation_lookup_hits           = 0;
     std::uint64_t continuation_lookup_misses         = 0;
     std::uint64_t continuation_preflight_rejections  = 0;

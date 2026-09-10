@@ -13,6 +13,7 @@
 #include "runtime/engine/stable_prefix_flights.h"
 #include "runtime/generation/generation_budget.h"
 #include "runtime/generation/repetition_guard.h"
+#include "runtime/generation/row_commit.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/frontend.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/prepared_prompt.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/runtime.h"
@@ -3117,7 +3118,11 @@ private:
         if (round.row_stride == 0 ||
             (!round.row_counts.empty() && round.row_counts.size() != lanes.size()) ||
             round.tokens.size() < static_cast<std::size_t>(round.row_stride) * lanes.size()) {
-            throw std::logic_error("decode batch returned an invalid ragged layout");
+            throw RoundFault("decode batch returned an invalid ragged layout: stride " +
+                             std::to_string(round.row_stride) + ", " +
+                             std::to_string(round.row_counts.size()) + " counts, " +
+                             std::to_string(round.tokens.size()) + " tokens across " +
+                             std::to_string(lanes.size()) + " lanes");
         }
 
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
@@ -3132,7 +3137,9 @@ private:
             const std::uint32_t count =
                 round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts[row]);
             if (count == 0 || count > round.row_stride) {
-                throw std::logic_error("decode batch returned an invalid licensed row extent");
+                throw RoundFault("decode batch returned an invalid licensed row extent: lane " +
+                                 std::to_string(lane) + " produced " + std::to_string(count) +
+                                 " of stride " + std::to_string(round.row_stride));
             }
             const auto row_tokens =
                 round.tokens.subspan(row * round.row_stride, static_cast<std::size_t>(count));
@@ -3141,23 +3148,29 @@ private:
                 accepted[row]       = 0;
                 terminal[row]       = 1;
                 finish_reasons[row] = FinishReason::Cancelled;
-                continue;
+            } else {
+                // A tripped guard ends the request, but the row still has to commit a licensed
+                // prefix: only a cancelled row may commit nothing. Licensing the round against
+                // its own extent makes the decoder terminalize here exactly as an exhausted
+                // budget does, and a stop token inside the round still wins and reports itself.
+                const bool repeating = request->repetition && request->repetition->tripped();
+                const OutputDecision decision = request->output.preview(
+                    row_tokens, repeating ? count : request->budget->remaining(),
+                    repeating ? FinishReason::RepetitionCycle : request->budget->limit_reason());
+                accepted[row]       = decision.accepted_tokens;
+                terminal[row]       = decision.finished() ? 1 : 0;
+                finish_reasons[row] = decision.finish_reason;
             }
-            // A tripped guard ends the request, but the row still has to commit a licensed
-            // prefix: only a cancelled row may commit nothing. Licensing the round against its
-            // own extent makes the decoder terminalize here exactly as an exhausted budget does,
-            // and a stop token inside the round still wins and reports itself.
-            const bool repeating = request->repetition && request->repetition->tripped();
-            const OutputDecision decision = request->output.preview(
-                row_tokens, repeating ? count : request->budget->remaining(),
-                repeating ? FinishReason::RepetitionCycle : request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
-                throw std::logic_error("output policy returned an invalid licensed prefix");
+            // Checked here as well as in the target so a branch that resolves a row without
+            // consulting the output policy cannot hand the fold an unlicensed prefix.
+            if (!runtime::row_commit_is_licensed(cancelled[row] != 0, accepted[row], count,
+                                                 terminal[row] != 0)) {
+                throw RoundFault("resolved decode row is not a licensed commit: lane " +
+                                 std::to_string(lane) + " committed " +
+                                 std::to_string(accepted[row]) + " of " + std::to_string(count) +
+                                 " produced, terminal " + std::to_string(terminal[row]) +
+                                 ", cancelled " + std::to_string(cancelled[row]));
             }
-            accepted[row]       = decision.accepted_tokens;
-            terminal[row]       = decision.finished() ? 1 : 0;
-            finish_reasons[row] = decision.finish_reason;
         }
 
         instance_.program->resolve_pending_batch(
@@ -3201,6 +3214,27 @@ private:
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (finished[row]) { complete_success(finished[row], finish_reasons[row]); }
         }
+    }
+
+    // Abandon the round in flight without retiring the executor. Every lane of a faulted round
+    // is left with its pending candidate unresolved, so recovery is round-scoped rather than
+    // per-lane: the requests it served fail, their lanes are aborted, and queued work still runs.
+    void fail_round(std::exception_ptr error) noexcept {
+        ++cumulative_stats_.decode_rounds_abandoned;
+        if (prefill_lane_) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        protection_.reset();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            const std::shared_ptr<Request> request = slots_[lane];
+            instance_.program->abort_lane(lane);
+            lane_sessions_[lane].reset();
+            remove_completed_slot(lane);
+            complete_error(request, error);
+        }
+        publish_runtime_stats();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
@@ -3349,7 +3383,7 @@ private:
                 execution_lock.unlock();
                 std::unique_lock queue_lock(queue_mutex_);
                 queue_cv_.wait_for(queue_lock, std::chrono::milliseconds(10));
-            } catch (...) {
+            } catch (const RoundFault&) { fail_round(std::current_exception()); } catch (...) {
                 fail_all(std::current_exception());
                 return;
             }

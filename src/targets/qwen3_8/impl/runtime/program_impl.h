@@ -8,6 +8,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/engine/l1_reuse_accounting.h"
+#include "runtime/generation/row_commit.h"
 
 #include <cuda_runtime.h>
 
@@ -960,7 +961,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
             requests[lane].pending.kind != PendingKind::Speculative) {
-            throw std::logic_error("speculative pending batch no longer matches Program state");
+            throw RoundFault("speculative pending batch no longer matches Program state: lane " +
+                             std::to_string(lane) + " of " + std::to_string(max_concurrency));
         }
         const PendingCandidate& pending = requests[lane].pending;
         const SequenceState& sequence   = sequences[lane];
@@ -973,13 +975,26 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
              sequence.mtp_kv_valid != pending.base_E) ||
             (speculative_backend == SpeculativeBackend::DFlash &&
              sequence.dflash_context_frontier != pending.base_E)) {
-            throw std::logic_error("speculative pending row is not at its recorded base");
+            throw RoundFault("speculative pending row is not at its recorded base: lane " +
+                             std::to_string(lane) + " base E/S " + std::to_string(pending.base_E) +
+                             "/" + std::to_string(pending.base_S) + ", frontier E/S " +
+                             std::to_string(sequence.execution_frontier) + "/" +
+                             std::to_string(sequence.ledger_frontier) + ", ledger " +
+                             std::to_string(sequence.ledger.size()) + ", identity " +
+                             std::to_string(sequence.prefix_identity.size()) + ", text kv " +
+                             std::to_string(sequence.text_kv_valid) + ", mtp kv " +
+                             std::to_string(sequence.mtp_kv_valid) + ", dflash " +
+                             std::to_string(sequence.dflash_context_frontier));
         }
         const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
-        if ((cancelled[row] && accepted_tokens[row] != 0) ||
-            (!cancelled[row] && (committed == 0 || committed > pending.produced ||
-                                 (!terminal[row] && committed != pending.produced)))) {
-            throw std::logic_error("speculative pending row has an invalid committed prefix");
+        if (!runtime::row_commit_is_licensed(cancelled[row] != 0, accepted_tokens[row],
+                                             pending.produced, terminal[row] != 0)) {
+            throw RoundFault("speculative pending row has an invalid committed prefix: lane " +
+                             std::to_string(lane) + " committed " + std::to_string(committed) +
+                             " of " + std::to_string(pending.produced) + " produced, accepted " +
+                             std::to_string(accepted_tokens[row]) + ", terminal " +
+                             std::to_string(terminal[row]) + ", cancelled " +
+                             std::to_string(cancelled[row]));
         }
         fold_rows[row] = ops::GdnReplayFoldRow{
             .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),

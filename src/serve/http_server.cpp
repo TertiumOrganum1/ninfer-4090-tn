@@ -818,6 +818,7 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
         {"rejected_queue_timeout", stats.admission_rejected_queue_timeout},
         {"decode_rounds", stats.decode_rounds},
         {"decode_row_rounds", stats.decode_row_rounds},
+        {"decode_rounds_abandoned", stats.decode_rounds_abandoned},
         {"worker_seconds",
          {{"decode", stats.worker_decode_seconds},
           {"prefill", stats.worker_prefill_seconds},
