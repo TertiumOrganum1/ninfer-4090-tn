@@ -347,6 +347,10 @@ struct MessagePart {
     MessagePartKind kind = MessagePartKind::Text;
     std::string text;
     OwnedMedia media;
+    // An explicit prompt-cache breakpoint: the rendered prefix through the end of this part is
+    // published as a content-addressed continuation any later request with the same prefix can
+    // restore. Placement follows OpenAI `prompt_cache_breakpoint` and Anthropic `cache_control`.
+    bool cache_breakpoint = false;
 };
 
 struct ChatMessage {
@@ -387,12 +391,22 @@ struct PromptCapabilities {
     ReasoningEffortCapabilities reasoning_effort;
 };
 
+// Which prompt-cache boundaries a request publishes and looks up. Implicit boundaries are the
+// system/tools prefix and the turn openers the server derives from the rendered chat; explicit
+// ones are the client's breakpoints. Explicit mode uses only the latter, as OpenAI's
+// `prompt_cache_options.mode` does. Routed sessions (`prompt_cache_key`) are a separate axis.
+enum class PromptCacheMode : std::uint8_t {
+    Implicit,
+    Explicit,
+};
+
 struct PromptOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
     std::optional<ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
     bool add_vision_id     = false;
+    PromptCacheMode prompt_cache_mode = PromptCacheMode::Implicit;
     std::vector<std::string> tool_jsons;
 };
 
@@ -623,6 +637,9 @@ struct ContinuationDiagnostics {
     std::uint64_t restore_microseconds        = 0;
     std::uint64_t restored_tokens             = 0;
     std::uint64_t restored_bytes              = 0;
+    // Tokens this request captured for content-addressed publication beyond what it restored:
+    // the deepest boundary it published minus its restored depth. OpenAI's `cache_write_tokens`.
+    std::uint64_t cache_write_tokens          = 0;
     // Deepest prefix any preflighted candidate agreed with this prompt on, whether or not the
     // candidate was usable. On a miss this separates a tail rewrite, which a deeper checkpoint
     // ladder can recover, from an early rewrite, which no ladder can.

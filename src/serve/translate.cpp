@@ -192,8 +192,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     newline.text = "\n";
                     message.parts.push_back(std::move(newline));
                 }
+                // The breakpoint rides on the text part; the synthetic joiner above never
+                // carries one.
                 ninfer::MessagePart text;
-                text.text = part.text;
+                text.text             = part.text;
+                text.cache_breakpoint = part.cache_breakpoint;
                 message.parts.push_back(std::move(text));
                 continue;
             }
@@ -202,8 +205,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     throw std::logic_error("media acquisition callback is not configured");
                 }
                 ninfer::MessagePart media;
-                media.kind  = ninfer::MessagePartKind::Media;
-                media.media = acquire_media(part);
+                media.kind             = ninfer::MessagePartKind::Media;
+                media.media            = acquire_media(part);
+                media.cache_breakpoint = part.cache_breakpoint;
                 message.parts.push_back(std::move(media));
                 continue;
             }
@@ -222,6 +226,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.reasoning_effort      = semantics.reasoning_effort;
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
+    input.options.prompt_cache_mode     = request.prompt_cache_mode;
     input.options.tool_jsons            = effective_tool_jsons(request);
     return input;
 }

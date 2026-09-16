@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -261,6 +262,25 @@ int test_official_tokenizer_merge() {
                               tokenizer.decode_token_bytes(id) == text,
                           "official tokenizer_config.json token did not merge exactly");
     }
+
+    // A client breakpoint inside a merged token snaps back to the last exact token prefix.
+    fi::ChatMessage glued = chat_message("user", "hel");
+    glued.parts.back().cache_breakpoint = true;
+    glued.parts.push_back(fi::ChatPart::text_part("lo world"));
+    fi::ChatRenderOptions explicit_options;
+    explicit_options.prompt_cache_mode  = ninfer::PromptCacheMode::Explicit;
+    const fi::RenderedChat glued_chat   = render_chat({glued}, explicit_options);
+    const fi::EncodedChat glued_encoded = fi::encode_rendered_chat(tokenizer, glued_chat);
+    const std::size_t cut               = glued_chat.boundaries.front().byte_offset;
+    const std::vector<int> cut_prefix =
+        tokenizer.encode(std::string_view(glued_chat.text).substr(0, cut));
+    const std::vector<int> opener_prefix = tokenizer.encode("<|im_start|>user\n");
+    failures += check(glued_chat.boundaries.size() == 1 && glued_encoded.boundaries.size() == 1 &&
+                          glued_encoded.boundaries.front().depth == opener_prefix.size() &&
+                          glued_encoded.boundaries.front().depth < cut_prefix.size() &&
+                          std::equal(opener_prefix.begin(), opener_prefix.end(),
+                                     glued_encoded.input_ids.begin()),
+                      "explicit cut inside a merged token did not snap to the exact prefix");
 
     FrontendResources conflicting = resources();
     nlohmann::json config         = nlohmann::json::parse(conflicting.tokenizer_config_json);
@@ -513,14 +533,23 @@ int test_turn_rewrite_trace() {
                   *rolled.turn_rewrite_byte_offset == rolling_header + assistant_header.size() &&
                   *rolled.turn_rewrite_byte_offset > *open.turn_rewrite_byte_offset,
               "rolling tool checkpoint did not advance to the generation opener");
+    // Every assistant opener is a lookup boundary; only the one at the rewrite frontier publishes.
     failures += check(
-        rolled.checkpoint_hints.size() == 3 &&
-            rolled.checkpoint_hints[0].kind == fi::SemanticCheckpointKind::StableTurn &&
-            rolled.checkpoint_hints[1].kind == fi::SemanticCheckpointKind::Rolling &&
-            rolled.checkpoint_hints[2].kind == fi::SemanticCheckpointKind::Rolling &&
-            rolled.checkpoint_hints[0].byte_offset < rolled.checkpoint_hints[1].byte_offset &&
-            rolled.checkpoint_hints[1].byte_offset < rolled.checkpoint_hints[2].byte_offset,
-        "semantic stable-turn and rolling checkpoint history is incomplete or unordered");
+        rolled.boundaries.size() == 3 &&
+            std::all_of(rolled.boundaries.begin(), rolled.boundaries.end(),
+                        [](const fi::PromptBoundaryByteHint& hint) {
+                            return hint.kind == ninfer::targets::qwen3_8::PromptBoundaryKind::TurnOpener;
+                        }) &&
+            rolled.boundaries[0].byte_offset < rolled.boundaries[1].byte_offset &&
+            rolled.boundaries[1].byte_offset < rolled.boundaries[2].byte_offset &&
+            !rolled.boundaries[0].publish && !rolled.boundaries[1].publish &&
+            rolled.boundaries[2].publish &&
+            rolled.boundaries[2].byte_offset == *rolled.turn_rewrite_byte_offset,
+        "rolling tool loop did not expose every turn opener with the frontier publishing");
+    failures += check(open.boundaries.size() == 1 &&
+                          open.boundaries.front().byte_offset == *open.turn_rewrite_byte_offset &&
+                          open.boundaries.front().publish,
+                      "stable-turn policy retained boundaries past its rewrite frontier");
 
     const fi::RenderedChat first_roll = render_chat(
         {chat_message("user", "question"), first, chat_message("tool", "result one")}, rolling);
@@ -660,6 +689,8 @@ int test_text_and_image_prepare(const Frontend& frontend) {
 }
 
 int test_stable_prefix_identity(const Frontend& frontend) {
+    using ninfer::targets::qwen3_8::PromptBoundary;
+    using ninfer::targets::qwen3_8::PromptBoundaryKind;
     const auto make_input = [](std::string user, std::vector<std::string> tools = {}) {
         ninfer::PromptInput input;
         ninfer::ChatMessage system;
@@ -678,33 +709,43 @@ int test_stable_prefix_identity(const Frontend& frontend) {
         input.options.tool_jsons = std::move(tools);
         return input;
     };
+    const auto system_tools_boundary = [](const auto& data) -> std::optional<PromptBoundary> {
+        for (const PromptBoundary& boundary : data.identity.boundaries) {
+            if (boundary.kind == PromptBoundaryKind::SystemTools) { return boundary; }
+        }
+        return std::nullopt;
+    };
 
     const auto first = frontend.prepare(make_input("x"));
     const auto second = frontend.prepare(make_input("xx"));
     const auto& first_data = FrontendFactory::inspect(first);
     const auto& second_data = FrontendFactory::inspect(second);
-    int failures = check(first_data.identity.stable_prefix_boundary &&
-                             first_data.identity.stable_prefix_boundary ==
-                                 second_data.identity.stable_prefix_boundary,
+    const auto first_stable  = system_tools_boundary(first_data);
+    const auto second_stable = system_tools_boundary(second_data);
+    int failures = check(first_stable && second_stable && first_stable->publish &&
+                             first_stable->depth == second_stable->depth,
                          "same system block did not produce a stable prefix boundary");
-    if (first_data.identity.stable_prefix_boundary) {
-        const std::size_t boundary = *first_data.identity.stable_prefix_boundary;
+    if (first_stable) {
+        const std::size_t boundary = first_stable->depth;
         failures += check(boundary < first_data.token_ids.size() &&
                               boundary < second_data.token_ids.size() &&
                               std::equal(first_data.token_ids.begin(),
                                          first_data.token_ids.begin() + boundary,
                                          second_data.token_ids.begin()),
                           "varying user messages changed stable prefix tokens");
-        failures += check(!first_data.identity.checkpoint_hints.empty() &&
-                              first_data.identity.checkpoint_hints.front().kind ==
-                                  ninfer::targets::qwen3_8::PromptCheckpointKind::StablePrefix &&
-                              first_data.identity.checkpoint_hints.front().boundary == boundary &&
-                              std::is_sorted(first_data.identity.checkpoint_hints.begin(),
-                                             first_data.identity.checkpoint_hints.end(),
+        failures += check(first_data.identity.boundaries.front().depth == boundary &&
+                              first_data.identity.boundaries.size() == 2 &&
+                              first_data.identity.boundaries.back().kind ==
+                                  PromptBoundaryKind::TurnOpener &&
+                              first_data.identity.boundaries.back().publish &&
+                              first_data.identity.boundaries.back().depth ==
+                                  first_data.identity.turn_rewrite_boundary &&
+                              std::is_sorted(first_data.identity.boundaries.begin(),
+                                             first_data.identity.boundaries.end(),
                                              [](const auto& lhs, const auto& rhs) {
-                                                 return lhs.boundary < rhs.boundary;
+                                                 return lhs.depth < rhs.depth;
                                              }),
-                          "semantic checkpoint history omitted or reordered stable prefix");
+                          "prompt boundaries omitted the stable prefix or the generation opener");
     }
 
     ninfer::PromptInput bare;
@@ -715,7 +756,7 @@ int test_stable_prefix_identity(const Frontend& frontend) {
                                                   .media = {}});
     bare.messages.push_back(std::move(bare_user));
     const auto no_stable = frontend.prepare(std::move(bare));
-    failures += check(!FrontendFactory::inspect(no_stable).identity.stable_prefix_boundary,
+    failures += check(!system_tools_boundary(FrontendFactory::inspect(no_stable)),
                       "prompt without a leading block published a stable prefix");
 
     const std::vector<std::string> tool_a = {
@@ -730,10 +771,16 @@ int test_stable_prefix_identity(const Frontend& frontend) {
         {chat_message("system", "x"), chat_message("user", "x")}, tool_a_options);
     const fi::RenderedChat with_tool_b = render_chat(
         {chat_message("system", "x"), chat_message("user", "x")}, tool_b_options);
-    failures += check(with_tool_a.stable_prefix_byte_offset &&
-                          with_tool_b.stable_prefix_byte_offset &&
-                          with_tool_a.text.substr(0, *with_tool_a.stable_prefix_byte_offset) !=
-                              with_tool_b.text.substr(0, *with_tool_b.stable_prefix_byte_offset),
+    const auto stable_bytes = [](const fi::RenderedChat& chat) -> std::optional<std::size_t> {
+        if (chat.boundaries.empty() ||
+            chat.boundaries.front().kind != PromptBoundaryKind::SystemTools) {
+            return std::nullopt;
+        }
+        return chat.boundaries.front().byte_offset;
+    };
+    failures += check(stable_bytes(with_tool_a) && stable_bytes(with_tool_b) &&
+                          with_tool_a.text.substr(0, *stable_bytes(with_tool_a)) !=
+                              with_tool_b.text.substr(0, *stable_bytes(with_tool_b)),
                       "tool definition change did not change stable prefix tokens");
 
     const fi::RenderedChat rendered = render_chat(
@@ -742,45 +789,41 @@ int test_stable_prefix_identity(const Frontend& frontend) {
                                    .tokenizer_config_json = resources().tokenizer_config_json,
                                    .generation_config_json = resources().generation_config_json});
     const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered);
-    const std::vector<int> exact_prefix = tokenizer.encode(
-        std::string_view(rendered.text).substr(0, *rendered.stable_prefix_byte_offset));
-    failures += check(encoded.stable_prefix_boundary == exact_prefix.size() &&
-                          std::equal(exact_prefix.begin(), exact_prefix.end(),
-                                     encoded.input_ids.begin()),
-                      "stable boundary was not separately tokenized as an exact prefix");
-    failures += check(encoded.checkpoint_hints.size() == rendered.checkpoint_hints.size() &&
-                          std::equal(encoded.checkpoint_hints.begin(),
-                                     encoded.checkpoint_hints.end(),
-                                     rendered.checkpoint_hints.begin(),
-                                     [&](const auto& token_hint, const auto& byte_hint) {
+    failures += check(stable_bytes(rendered).has_value() &&
+                          encoded.boundaries.size() == rendered.boundaries.size() &&
+                          std::equal(encoded.boundaries.begin(), encoded.boundaries.end(),
+                                     rendered.boundaries.begin(),
+                                     [&](const PromptBoundary& token_hint,
+                                         const fi::PromptBoundaryByteHint& byte_hint) {
                                          const std::vector<int> prefix = tokenizer.encode(
                                              std::string_view(rendered.text)
                                                  .substr(0, byte_hint.byte_offset));
                                          return token_hint.kind == byte_hint.kind &&
-                                                token_hint.boundary == prefix.size() &&
+                                                token_hint.publish == byte_hint.publish &&
+                                                token_hint.depth == prefix.size() &&
                                                 std::equal(prefix.begin(), prefix.end(),
                                                            encoded.input_ids.begin());
                                      }),
-                      "semantic byte boundaries were not independently exact-prefix validated");
+                      "template byte boundaries were not independently exact-prefix validated");
 
     fi::RenderedChat unstable = rendered;
-    unstable.stable_prefix_byte_offset = 1;
+    unstable.boundaries.front().byte_offset = 1;
     failures += check(throws_logic_error(
                           [&] { (void)fi::encode_rendered_chat(tokenizer, unstable); }),
-                      "tokenizer-unstable byte boundary was accepted");
+                      "tokenizer-unstable template byte boundary was accepted");
 
     fi::RenderedChat media_boundary;
     media_boundary.text = "<|image_pad|>suffix";
     media_boundary.turn_rewrite_byte_offset = std::string_view("<|image_pad|>").size();
-    media_boundary.checkpoint_hints.push_back(
-        {fi::SemanticCheckpointKind::Rolling, *media_boundary.turn_rewrite_byte_offset});
+    media_boundary.boundaries.push_back(
+        {PromptBoundaryKind::TurnOpener, *media_boundary.turn_rewrite_byte_offset, true});
     const std::size_t old_boundary = *media_boundary.turn_rewrite_byte_offset;
     fi::adjust_rendered_boundaries_for_replacement(media_boundary, 0, old_boundary,
                                                    old_boundary * 2);
     failures += check(media_boundary.turn_rewrite_byte_offset == old_boundary * 2 &&
-                          media_boundary.checkpoint_hints.front().byte_offset == old_boundary * 2,
+                          media_boundary.boundaries.front().byte_offset == old_boundary * 2,
                       "media expansion did not adjust every boundary");
-    media_boundary.checkpoint_hints.front().byte_offset = 1;
+    media_boundary.boundaries.front().byte_offset = 1;
     failures += check(throws_logic_error([&] {
                           fi::adjust_rendered_boundaries_for_replacement(media_boundary, 0,
                                                                          old_boundary,
@@ -796,10 +839,136 @@ int test_stable_prefix_identity(const Frontend& frontend) {
         {chat_message("user", "hello")}, low_options);
     const fi::RenderedChat xhigh = reasoning_effort_template().render(
         {chat_message("user", "hello")}, xhigh_options);
-    failures += check(low.stable_prefix_byte_offset && xhigh.stable_prefix_byte_offset &&
-                          low.text.substr(0, *low.stable_prefix_byte_offset) !=
-                              xhigh.text.substr(0, *xhigh.stable_prefix_byte_offset),
+    failures += check(stable_bytes(low) && stable_bytes(xhigh) &&
+                          low.text.substr(0, *stable_bytes(low)) !=
+                              xhigh.text.substr(0, *stable_bytes(xhigh)),
                       "reasoning instruction change did not change stable block identity");
+    return failures;
+}
+
+int test_explicit_breakpoints() {
+    using ninfer::targets::qwen3_8::PromptBoundary;
+    using ninfer::targets::qwen3_8::PromptBoundaryKind;
+    const auto marked = [](fi::ChatMessage message, std::size_t part) {
+        message.parts.at(part).cache_breakpoint = true;
+        return message;
+    };
+    // Built from the fixture vocabulary so the rendering also encodes.
+    fi::ChatMessage split = chat_message("user", "x");
+    split.parts.push_back(fi::ChatPart::text_part("OPtail"));
+    const std::vector<fi::ChatMessage> conversation{
+        chat_message("system", "x"), marked(split, 0), chat_message("assistant", "helloST"),
+        marked(chat_message("user", "OPtail"), 0)};
+
+    const fi::RenderedChat implicit = render_chat(conversation);
+    const std::string first_user    = "user\nxOPtail";
+    const std::size_t x_end = implicit.text.find(first_user) + std::string_view("user\nx").size();
+    // A breakpoint on the final message sits at the generation opener, merging with the
+    // implicit turn-opener boundary there.
+    const std::size_t next_end = *implicit.turn_rewrite_byte_offset;
+    const auto kinds = [](const fi::RenderedChat& chat) {
+        std::vector<PromptBoundaryKind> out;
+        for (const auto& hint : chat.boundaries) { out.push_back(hint.kind); }
+        return out;
+    };
+    int failures = check(
+        kinds(implicit) == std::vector<PromptBoundaryKind>{
+                               PromptBoundaryKind::SystemTools, PromptBoundaryKind::Explicit,
+                               PromptBoundaryKind::TurnOpener, PromptBoundaryKind::Explicit} &&
+            implicit.boundaries[1].byte_offset == x_end && implicit.boundaries[1].publish &&
+            implicit.boundaries[3].byte_offset == next_end && implicit.boundaries[3].publish &&
+            !implicit.boundaries[2].publish &&
+            implicit.text.compare(next_end - std::string_view("<|im_start|>assistant\n").size(),
+                                  std::string_view("<|im_start|>assistant\n").size(),
+                                  "<|im_start|>assistant\n") == 0,
+        "implicit mode did not interleave client breakpoints with template boundaries");
+    // Without a generation prompt the final message's breakpoint sits after its close.
+    fi::ChatRenderOptions no_generation;
+    no_generation.add_generation_prompt = false;
+    const fi::RenderedChat closed       = render_chat(conversation, no_generation);
+    failures += check(!closed.boundaries.empty() &&
+                          closed.boundaries.back().kind == PromptBoundaryKind::Explicit &&
+                          closed.boundaries.back().byte_offset == closed.text.size() &&
+                          closed.text.ends_with("OPtail<|im_end|>\n"),
+                      "final-message breakpoint without a generation prompt left the close");
+
+    fi::ChatRenderOptions explicit_options;
+    explicit_options.prompt_cache_mode = ninfer::PromptCacheMode::Explicit;
+    const fi::RenderedChat explicit_only = render_chat(conversation, explicit_options);
+    failures += check(kinds(explicit_only) == std::vector<PromptBoundaryKind>{
+                                                  PromptBoundaryKind::Explicit,
+                                                  PromptBoundaryKind::Explicit} &&
+                          explicit_only.boundaries[0].byte_offset == x_end &&
+                          explicit_only.boundaries[1].byte_offset == next_end &&
+                          explicit_only.text == implicit.text,
+                      "explicit mode emitted template boundaries or changed the rendering");
+
+    // A breakpoint on a system message reaches the system/tools prefix in explicit mode.
+    const fi::RenderedChat system_marked = render_chat(
+        {marked(chat_message("system", "x"), 0), chat_message("user", "x")}, explicit_options);
+    failures += check(system_marked.boundaries.size() == 1 &&
+                          system_marked.boundaries.front().kind == PromptBoundaryKind::Explicit &&
+                          system_marked.boundaries.front().byte_offset ==
+                              implicit.boundaries.front().byte_offset,
+                      "system breakpoint did not land on the system/tools boundary");
+
+    // A breakpoint past the rewrite frontier would leave the lane nothing to rewind to.
+    fi::ChatRenderOptions stable;
+    stable.prefix_checkpoint_policy = ninfer::PrefixCheckpointPolicy::StableTurn;
+    fi::ChatMessage call            = chat_message("assistant", "");
+    call.tool_calls.push_back({.id = "c", .name = "f", .arguments_json = "{}"});
+    const fi::RenderedChat clipped = render_chat(
+        {chat_message("user", "q"), call, marked(chat_message("tool", "result"), 0)}, stable);
+    failures += check(std::none_of(clipped.boundaries.begin(), clipped.boundaries.end(),
+                                   [&](const fi::PromptBoundaryByteHint& hint) {
+                                       return hint.byte_offset > *clipped.turn_rewrite_byte_offset;
+                                   }) &&
+                          std::none_of(clipped.boundaries.begin(), clipped.boundaries.end(),
+                                       [](const fi::PromptBoundaryByteHint& hint) {
+                                           return hint.kind == PromptBoundaryKind::Explicit;
+                                       }),
+                      "breakpoint past the stable-turn rewrite frontier was retained");
+    fi::ChatRenderOptions rolling;
+    rolling.prefix_checkpoint_policy = ninfer::PrefixCheckpointPolicy::RollingTool;
+    const fi::RenderedChat rolled = render_chat(
+        {chat_message("user", "q"), call, marked(chat_message("tool", "result"), 0)}, rolling);
+    failures += check(!rolled.boundaries.empty() &&
+                          rolled.boundaries.back().kind == PromptBoundaryKind::Explicit &&
+                          rolled.boundaries.back().publish &&
+                          rolled.boundaries.back().byte_offset ==
+                              *rolled.turn_rewrite_byte_offset &&
+                          std::count_if(rolled.boundaries.begin(), rolled.boundaries.end(),
+                                        [](const fi::PromptBoundaryByteHint& hint) {
+                                            return hint.kind == PromptBoundaryKind::Explicit;
+                                        }) == 1,
+                      "final tool result breakpoint did not merge into the rolling frontier");
+
+    const fi::Tokenizer tokenizer({.tokenizer_json = resources().tokenizer_json,
+                                   .tokenizer_config_json = resources().tokenizer_config_json,
+                                   .generation_config_json = resources().generation_config_json});
+    const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, explicit_only);
+    const std::vector<int> x_prefix =
+        tokenizer.encode(std::string_view(explicit_only.text).substr(0, x_end));
+    const std::vector<int> next_prefix =
+        tokenizer.encode(std::string_view(explicit_only.text).substr(0, next_end));
+    failures += check(encoded.boundaries.size() == 2 &&
+                          encoded.boundaries[0].kind == PromptBoundaryKind::Explicit &&
+                          encoded.boundaries[0].publish &&
+                          encoded.boundaries[0].depth == x_prefix.size() &&
+                          encoded.boundaries[1].depth == next_prefix.size() &&
+                          std::equal(next_prefix.begin(), next_prefix.end(),
+                                     encoded.input_ids.begin()),
+                      "token-aligned explicit cuts did not encode as exact prefixes");
+
+    // A cut inside a token has no exact prefix at all with this vocabulary: the boundary is
+    // dropped rather than reported at a depth the tokens do not support.
+    fi::ChatMessage glued = chat_message("user", "hello");
+    glued.parts.push_back(fi::ChatPart::text_part("ST"));
+    const fi::RenderedChat glued_chat = render_chat({marked(glued, 0)}, explicit_options);
+    const fi::EncodedChat glued_encoded = fi::encode_rendered_chat(tokenizer, glued_chat);
+    failures += check(glued_chat.boundaries.size() == 1 && glued_encoded.boundaries.empty() &&
+                          glued_encoded.input_ids.size() > 2,
+                      "unencodable explicit cut was not dropped");
     return failures;
 }
 
@@ -1074,6 +1243,7 @@ int main() {
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_stable_prefix_identity(frontend);
+    failures += test_explicit_breakpoints();
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);

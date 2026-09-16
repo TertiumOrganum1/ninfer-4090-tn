@@ -98,6 +98,12 @@ may be a string or an ordered array containing:
 history may include `reasoning_content` and `tool_calls`; a tool result uses role `tool` and
 `tool_call_id`.
 
+A text part may carry `"prompt_cache_breakpoint": {"mode": "explicit"}` and the object form may
+set `"prompt_cache_options": {"mode": "implicit" | "explicit"}`, with the same placement and
+mode semantics as the server's [prompt cache breakpoints](serving.md#prompt-cache-breakpoints).
+They publish and restore continuation images only when a continuation cache with L2 or L3 is
+selected.
+
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
 long-decode, and long-context inputs.
 

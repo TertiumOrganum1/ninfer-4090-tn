@@ -96,14 +96,9 @@ struct ProcessedInput {
     // Row-major [sum(raw_patches), 1536], in the exact merger-friendly order.
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
-    std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     std::optional<std::uint32_t> user_turn_boundary;
-    struct CheckpointHint {
-        SemanticCheckpointKind kind = SemanticCheckpointKind::StablePrefix;
-        std::uint32_t boundary      = 0;
-    };
-    std::vector<CheckpointHint> checkpoint_hints;
+    std::vector<PromptBoundary> boundaries;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -111,10 +106,12 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
-    std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     std::optional<std::uint32_t> user_turn_boundary;
-    std::vector<ProcessedInput::CheckpointHint> checkpoint_hints;
+    // Strictly ascending token depths. Template-derived boundaries must be exact token prefixes;
+    // an explicit one snaps back to the longest exact token prefix of its byte cut, and one that
+    // collapses onto an earlier boundary is dropped.
+    std::vector<PromptBoundary> boundaries;
 };
 
 void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::size_t position,

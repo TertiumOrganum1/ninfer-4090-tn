@@ -280,6 +280,7 @@ wire response contains typed `output` Items.
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
 | `prompt_cache_key` | optional continuation-session routing hint; reuse is authorized only by exact prefix and runtime compatibility checks |
+| `prompt_cache_options` | optional `{"mode": "implicit"}` (default) or `{"mode": "explicit"}`; see [Prompt cache breakpoints](#prompt-cache-breakpoints); any other member, including retention, returns `parameter_not_supported` |
 | `max_output_tokens` | integer at least `16`; default is `--default-max-tokens` |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
@@ -311,13 +312,13 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | Item | Supported form |
 |---|---|
 | `message` | roles `user`, `assistant`, `system`, and `developer`; string content or typed content array |
-| `input_text` | message content part containing string `text` |
-| `output_text` | assistant-message replay part containing string `text` |
+| `input_text` | message content part containing string `text`; optional `prompt_cache_breakpoint` |
+| `output_text` | assistant-message replay part containing string `text`; optional `prompt_cache_breakpoint` |
 | `input_image` | user-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | native `summary_text` replay Item; legacy raw `reasoning_text` content is also accepted; `encrypted_content` may be null for SDK compatibility but non-null values return `encrypted_reasoning_not_supported` |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
-| `function_call_output` | completed tool result with required `call_id`; `output` may be a string or a non-empty array of `input_text` and `input_image` parts |
+| `function_call_output` | completed tool result with required `call_id`; `output` may be a string or a non-empty array of `input_text` and `input_image` parts; an `input_text` part accepts `prompt_cache_breakpoint` |
 
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
 to the following assistant message or function call. Input Item IDs are preserved when supplied and
@@ -328,6 +329,70 @@ Item/content types are not supported. Rich function outputs support text and ima
 HTTP media
 URLs stored in a response chain are fetched again when that chain is continued; use data URIs when
 the historical media bytes must be immutable.
+
+### Prompt cache breakpoints
+
+Every prompt is content-addressed at a small set of boundaries. A boundary is a token depth at
+which the Engine can restore a previously published continuation image (KV pages plus the GDN and
+speculative state needed to continue) into whichever request shares the exact tokens through that
+depth, whether or not that request carries the same `prompt_cache_key`. By default the boundaries
+are implicit: the end of the system/developer/tools prefix, and every `<|im_start|>assistant`
+opener in the history. Implicit boundaries are looked up on every request; the system/tools
+boundary and the opener at the turn-rewrite frontier are also published, so a repeated prefix is
+found without any client cooperation.
+
+A client that knows where its stable content ends can mark it instead:
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "prompt_cache_options": {"mode": "explicit"},
+  "input": [
+    {"role": "developer", "content": [
+      {"type": "input_text", "text": "...long instructions...",
+       "prompt_cache_breakpoint": {"mode": "explicit"}}]},
+    {"role": "user", "content": [
+      {"type": "input_text", "text": "...large document...",
+       "prompt_cache_breakpoint": {"mode": "explicit"}},
+      {"type": "input_text", "text": "Summarize the document."}]}
+  ]
+}
+```
+
+`prompt_cache_breakpoint` is accepted on `input_text`, `output_text`, and `function_call_output`
+`input_text` parts, and must be exactly `{"mode": "explicit"}` (`invalid_value` otherwise; other
+members return `parameter_not_supported`). A marked part that ends its message places the boundary
+after the rendered message close, so the whole message including its template framing is
+cacheable; a marked part followed by more parts places the boundary at the end of that part's
+text. On the final message the boundary sits at the assistant opener the request appends, which
+is exactly the prefix the next turn's history reproduces. A breakpoint on a system or developer
+message lands on the system/tools boundary. Marked boundaries are always looked up and always
+published. A byte cut inside a merged token snaps back to the deepest exact token prefix before
+it, and a boundary past the turn-rewrite frontier is dropped because the lane must end the
+request holding state there. At most four breakpoints are accepted per request; a fifth returns
+`too_many_prompt_cache_breakpoints`. Top-level `instructions` is a string and cannot carry a
+breakpoint.
+
+Publishing is not free in the same way everywhere. The boundary at the turn-rewrite frontier
+(the generation opener, and therefore a final-message breakpoint) is published from the
+completed lane's image after the last token, off the request's own latency path. Every other
+boundary is captured during prefill, which stops at that depth and copies the state through it
+to the host before continuing; a request pays that once per unpublished prefix, and concurrent
+requests needing the same one wait for a single builder. Mark a large stable prefix once, not
+every block.
+
+`prompt_cache_options.mode` selects how the implicit boundaries combine with marked ones.
+`implicit` keeps them all, so a marked request still benefits from template boundaries.
+`explicit` suppresses the implicit system/tools and opener boundaries and content-addresses only
+the marked parts. Neither mode changes `prompt_cache_key` session routing or the lane-local
+checkpoints that serve a resident conversation; both keep working without breakpoints.
+
+Breakpoints are content-addressed, so they never grant access to state: a request reaches a
+boundary's image only by presenting the exact tokens, token types, and MRoPE positions through
+that depth under the same artifact/runtime compatibility key. The images live in the L2/L3
+continuation tiers selected at startup (`--continuation-cache l1-l2` or `l1-l2-l3`); without
+those tiers, breakpoints are accepted but publish nothing, and only resident-lane prefix reuse and
+retained L1 lanes apply.
 
 ### Function tools
 
@@ -376,7 +441,7 @@ Usage is checkpoint-native:
 ```json
 {
   "input_tokens": 42,
-  "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 0},
+  "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 25},
   "output_tokens": 12,
   "output_tokens_details": {"reasoning_tokens": 5},
   "total_tokens": 54
@@ -384,8 +449,11 @@ Usage is checkpoint-native:
 ```
 
 `input_tokens` includes the chat template and expanded media tokens. `cached_tokens` is the exact
-resident prompt prefix reused by Engine. `cache_write_tokens` is always `0`: NInfer reports
-read-side prefix reuse but does not expose an OpenAI cache-write billing category.
+prompt prefix the Engine reused, whether from a resident lane or a restored continuation image.
+`cache_write_tokens` is the depth of the deepest boundary this request captured for publication
+beyond what it reused, clamped so that `cached_tokens + cache_write_tokens <= input_tokens`; it is
+`0` when the request published nothing new, including when every boundary was already in the
+cache. Neither value is a billing category.
 `output_tokens` is the count of accepted generated token IDs, including a withheld stop token when
 applicable. `reasoning_tokens` is counted in the Qwen output decoder while accepted tokens are
 still in the reasoning channel; it is not estimated by re-tokenizing decoded text.
@@ -511,6 +579,21 @@ an effort with `thinking.type: "disabled"` is rejected as contradictory.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
+`cache_control: {"type": "ephemeral"}` on a `text` or `tool_result` block marks a
+[prompt cache breakpoint](#prompt-cache-breakpoints) at the end of that block, with the same
+placement, snapping, and four-per-request limit as the Responses field
+(`too_many_cache_control_breakpoints`). On `system` blocks and `tools[]` entries it is accepted and
+counts toward the limit, but changes nothing: that prefix is already an implicit boundary. Only the
+ephemeral kind exists (`invalid_value` otherwise) and `ttl` returns `parameter_not_supported`,
+because retention is the server's continuation-cache idle timers. The Messages API has no mode
+switch; implicit boundaries stay active.
+
+Usage follows the Anthropic split: `input_tokens` counts only the uncached prompt tokens,
+`cache_read_input_tokens` the prefix restored from a lane or continuation image, and
+`cache_creation_input_tokens` the tokens this request captured for publication beyond that; the
+three sum to the prompt. Streaming reports the whole prompt as `input_tokens` in `message_start`,
+before admission decides what is reused, and the final split in the `message_delta` usage.
+
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
 without running GPU generation:
 
@@ -621,8 +704,9 @@ Use a stable, distinct `prompt_cache_key` for each of two or three OpenCode sess
 `repo-a`, `repo-b`, and `repo-c`. The key selects a candidate session head; it is not trusted as
 prompt identity. NInfer verifies the complete artifact/runtime compatibility domain and exact
 tokens, positions, media ledger, and boundary before restore, so accidental key reuse is a safe
-miss. Exact stable system/developer/tool prefixes also receive automatic immutable aliases and can
-be shared across independent requests with different user suffixes.
+miss. Prompt boundaries — the system/developer/tool prefix, assistant openers, and client
+[prompt cache breakpoints](#prompt-cache-breakpoints) — also receive content-addressed immutable
+aliases and can be shared across independent requests with different suffixes.
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \

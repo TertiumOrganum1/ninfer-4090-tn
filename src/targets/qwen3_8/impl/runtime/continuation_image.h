@@ -6,6 +6,7 @@
 #include "core/paged_kv_cache.h"
 #include "runtime/cache/continuation_cache.h"
 #include "targets/qwen3_8/impl/runtime/prefix_identity.h"
+#include <ninfer/targets/qwen3_8/runtime.h>
 
 #include <bit>
 #include <algorithm>
@@ -284,11 +285,14 @@ inline cache::Bytes prefix_filter_digest(const PreparedPromptData& prompt, std::
                                 depth);
 }
 
-inline std::optional<std::string> stable_alias(
-    std::span<const std::uint8_t> compatibility_key, const PreparedPromptData& prompt) {
-    if (!prompt.identity.reusable || !prompt.identity.stable_prefix_boundary) return std::nullopt;
-    const std::uint32_t boundary = *prompt.identity.stable_prefix_boundary;
-    if (boundary == 0 || boundary > prompt.token_ids.size() ||
+// Content-addressed alias of the exact prompt prefix through `depth`: the tokens, their
+// types and MRoPE positions, under one compatibility key. Any prompt sharing that prefix
+// derives the same name, which is what lets a boundary published by one conversation serve
+// another. The canonical form is versioned; bumping it retires every alias derived before.
+inline std::optional<std::string> boundary_alias(std::span<const std::uint8_t> compatibility_key,
+                                                 const PreparedPromptData& prompt,
+                                                 std::uint32_t depth) {
+    if (!prompt.identity.reusable || depth == 0 || depth > prompt.token_ids.size() ||
         prompt.token_types.size() != prompt.token_ids.size() ||
         prompt.positions.size() != 3 * prompt.token_ids.size()) {
         return std::nullopt;
@@ -296,15 +300,15 @@ inline std::optional<std::string> stable_alias(
 
     ResidentPrefixIdentity identity;
     identity.assign(prompt);
-    identity.truncate(boundary);
+    identity.truncate(depth);
     std::vector<TokenId> tokens(prompt.token_ids.begin(),
-                                prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(boundary));
-    const cache::Bytes exact = encode_prefix(tokens, identity.export_prefix(boundary));
+                                prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(depth));
+    const cache::Bytes exact = encode_prefix(tokens, identity.export_prefix(depth));
     Writer canonical;
     canonical.string("ninfer/qwen3.8/stable-prefix-alias");
-    canonical.u32(1);
+    canonical.u32(2);
     canonical.blob(compatibility_key);
-    canonical.u32(boundary);
+    canonical.u32(depth);
     canonical.blob(exact);
     const cache::Bytes bytes = std::move(canonical).finish();
     artifact::Sha256 hash;
@@ -313,7 +317,7 @@ inline std::optional<std::string> stable_alias(
     constexpr char hex[] = "0123456789abcdef";
     // The cache treats an alias name as opaque and carries what it means in AliasKind, so this
     // namespace exists only to keep the target's own alias space distinct from a routing hint.
-    std::string alias("@stable/v1/");
+    std::string alias("@stable/v2/");
     alias.reserve(alias.size() + 64);
     for (const std::uint8_t byte : digest) {
         alias.push_back(hex[byte >> 4]);
@@ -322,12 +326,52 @@ inline std::optional<std::string> stable_alias(
     return alias;
 }
 
+// Turn openers older than this many are not looked up: each lookup hashes the prefix through
+// its depth and costs a cache probe, and a conversation's reusable state is at its recent
+// openers. System/tools and explicit boundaries are always looked up.
+constexpr std::size_t kTurnOpenerLookupWindow = 8;
+
+inline std::vector<PromptBoundaryAlias> boundary_aliases(
+    std::span<const std::uint8_t> compatibility_key, const PreparedPromptData& prompt) {
+    std::vector<PromptBoundaryAlias> result;
+    if (!prompt.identity.reusable) return result;
+    std::size_t openers = 0;
+    for (const PromptBoundary& boundary : prompt.identity.boundaries) {
+        if (boundary.kind == PromptBoundaryKind::TurnOpener) ++openers;
+    }
+    const std::size_t skipped_openers =
+        openers > kTurnOpenerLookupWindow ? openers - kTurnOpenerLookupWindow : 0;
+    std::size_t opener_index = 0;
+    result.reserve(prompt.identity.boundaries.size());
+    for (const PromptBoundary& boundary : prompt.identity.boundaries) {
+        if (boundary.kind == PromptBoundaryKind::TurnOpener && opener_index++ < skipped_openers) {
+            continue;
+        }
+        std::optional<std::string> alias = boundary_alias(compatibility_key, prompt, boundary.depth);
+        if (!alias) continue;
+        result.push_back(PromptBoundaryAlias{
+            .depth            = boundary.depth,
+            .kind             = boundary.kind,
+            .publish          = boundary.publish,
+            .rewrite_frontier = prompt.identity.turn_rewrite_boundary == boundary.depth,
+            .alias            = std::move(*alias)});
+    }
+    return result;
+}
+
+// The nearest frontier past the cursor among the lane's capture points, so every prefill chunk
+// ends exactly on a frontier the lane must snapshot. `boundaries` is ascending.
 inline std::optional<std::uint32_t>
-next_prefill_checkpoint(std::uint32_t cursor, std::optional<std::uint32_t> stable,
+next_prefill_checkpoint(std::uint32_t cursor, std::span<const std::uint32_t> boundaries,
                         std::optional<std::uint32_t> turn,
                         std::optional<std::uint32_t> user_turn) noexcept {
     std::optional<std::uint32_t> next;
-    if (stable && *stable > cursor) next = stable;
+    for (const std::uint32_t boundary : boundaries) {
+        if (boundary > cursor) {
+            next = boundary;
+            break;
+        }
+    }
     if (user_turn && *user_turn > cursor && (!next || *user_turn < *next)) next = user_turn;
     if (turn && *turn > cursor && (!next || *turn < *next)) next = turn;
     return next;

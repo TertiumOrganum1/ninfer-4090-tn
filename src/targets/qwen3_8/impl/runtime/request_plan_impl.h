@@ -166,16 +166,21 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->turn_rewrite_boundary = candidate;
     }
-    if (prompt.identity.stable_prefix_boundary) {
-        const std::uint32_t candidate = *prompt.identity.stable_prefix_boundary;
-        if (candidate == 0 || candidate > base->summary.prompt_tokens) {
-            throw std::invalid_argument("stable prefix boundary must lie inside the prompt");
+    std::uint32_t previous_boundary = 0;
+    std::optional<std::uint32_t> system_tools_boundary;
+    for (const PromptBoundary& boundary : prompt.identity.boundaries) {
+        if (boundary.depth <= previous_boundary || boundary.depth > base->summary.prompt_tokens) {
+            throw std::invalid_argument("prompt boundaries must ascend inside the prompt");
         }
-        qwen3_8::detail::ResidentPrefixIdentity stable_identity;
-        stable_identity.assign(prompt);
-        stable_identity.truncate(candidate);
-        base->stable_prefix_boundary = candidate;
+        if (base->turn_rewrite_boundary && boundary.depth > *base->turn_rewrite_boundary) {
+            throw std::invalid_argument("prompt boundary must not follow the rewrite boundary");
+        }
+        if (boundary.kind == PromptBoundaryKind::SystemTools) {
+            system_tools_boundary = boundary.depth;
+        }
+        previous_boundary = boundary.depth;
     }
+    base->boundaries = prompt.identity.boundaries;
     if (prompt.identity.user_turn_boundary) {
         const std::uint32_t candidate = *prompt.identity.user_turn_boundary;
         if (candidate == 0 || candidate >= base->summary.prompt_tokens) {
@@ -183,26 +188,24 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->user_turn_boundary = candidate;
     }
-    if (base->stable_prefix_boundary && base->turn_rewrite_boundary &&
-        *base->stable_prefix_boundary > *base->turn_rewrite_boundary) {
-        throw std::invalid_argument("stable prefix boundary must not follow the rewrite boundary");
-    }
-    // The user-turn anchor is only useful strictly between the stable prefix and the rewrite
-    // frontier: outside that window it duplicates an anchor the lane already holds.
+    // The user-turn anchor is only useful strictly between the system/tools prefix and the
+    // rewrite frontier: outside that window it duplicates an anchor the lane already holds.
     if (base->user_turn_boundary &&
-        ((base->stable_prefix_boundary &&
-          *base->user_turn_boundary <= *base->stable_prefix_boundary) ||
+        ((system_tools_boundary && *base->user_turn_boundary <= *system_tools_boundary) ||
          (base->turn_rewrite_boundary &&
           *base->user_turn_boundary >= *base->turn_rewrite_boundary))) {
         base->user_turn_boundary.reset();
     }
+    // Every publish boundary is a potential chunk split on a cold prefill; one that coincides
+    // with the rewrite frontier is already counted.
+    std::size_t publish_splits = 0;
+    for (const PromptBoundary& boundary : base->boundaries) {
+        if (boundary.publish && boundary.depth != base->turn_rewrite_boundary) { ++publish_splits; }
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
         (base->turn_rewrite_boundary ? 1ULL : 0ULL) + (base->user_turn_boundary ? 1ULL : 0ULL) +
-        (base->stable_prefix_boundary &&
-                 base->stable_prefix_boundary != base->turn_rewrite_boundary
-             ? 1ULL
-             : 0ULL);
+        publish_splits;
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
@@ -210,7 +213,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
 
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
-                                                   const RequestBasePlan& base_plan) {
+                                                   const RequestBasePlan& base_plan,
+                                                   std::span<const std::uint32_t> capture_depths) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     const SequenceState& sequence = sequences[lane];
@@ -318,10 +322,6 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
-    if (base.stable_prefix_boundary && *base.stable_prefix_boundary > plan->reuse_base) {
-        plan->stable_checkpoint_capture_frontier = base.stable_prefix_boundary;
-    }
-
     const std::optional<std::uint32_t> desired = base.turn_rewrite_boundary;
     const bool can_keep                        = desired && plan->reuse != ReusePath::FullReset &&
                           sequence.turn_checkpoint.valid &&
@@ -352,6 +352,25 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     if (user_turn && !plan->keep_user_turn_anchor && *user_turn > plan->reuse_base &&
         speculative_backend != SpeculativeBackend::DFlash) {
         plan->user_turn_capture_frontier = user_turn;
+    }
+
+    // Capture only at boundaries the caller builds and that this lane will actually prefill
+    // through; a depth already covered by the reused prefix has nothing to capture. This follows
+    // the reuse decision above so a reset to a cold prefill captures everything it builds.
+    std::uint32_t previous_capture = 0;
+    for (const std::uint32_t depth : capture_depths) {
+        if (depth <= previous_capture) {
+            throw std::invalid_argument("capture depths must be strictly ascending");
+        }
+        previous_capture = depth;
+        const bool known = std::any_of(base.boundaries.begin(), base.boundaries.end(),
+                                       [&](const PromptBoundary& boundary) {
+                                           return boundary.depth == depth && boundary.publish;
+                                       });
+        if (!known) {
+            throw std::invalid_argument("capture depth is not a publish boundary of the prompt");
+        }
+        if (depth > plan->reuse_base) { plan->capture_frontiers.push_back(depth); }
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
@@ -390,15 +409,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    std::size_t capture_splits = 0;
+    for (const std::uint32_t depth : plan->capture_frontiers) {
+        if (depth != plan->turn_checkpoint_capture_frontier) { ++capture_splits; }
+    }
     const std::size_t prefill_splits =
         (plan->vision ? plan->vision->uses.size() : 0ULL) +
         (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) +
-        (plan->user_turn_capture_frontier ? 1ULL : 0ULL) +
-        (plan->stable_checkpoint_capture_frontier &&
-                 plan->stable_checkpoint_capture_frontier !=
-                     plan->turn_checkpoint_capture_frontier
-             ? 1ULL
-             : 0ULL);
+        (plan->user_turn_capture_frontier ? 1ULL : 0ULL) + capture_splits;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));

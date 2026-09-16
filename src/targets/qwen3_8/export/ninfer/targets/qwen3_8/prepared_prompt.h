@@ -39,27 +39,35 @@ struct VisionItem {
     std::vector<TokenSpan> token_spans;
 };
 
-enum class PromptCheckpointKind : std::uint8_t {
-    StablePrefix,
-    StableTurn,
-    Rolling,
+// A content-addressed prefix boundary. Every boundary names a continuation alias that any
+// later prompt sharing the exact tokens through `depth` can restore from; the ones marked
+// `publish` are captured during prefill and published under that alias.
+enum class PromptBoundaryKind : std::uint8_t {
+    // End of the initial system/tools block: the prefix independent conversations share.
+    SystemTools,
+    // An `<|im_start|>assistant\n` opener. Every one is a lookup candidate; the one that equals
+    // the turn-rewrite frontier publishes.
+    TurnOpener,
+    // A client breakpoint. Always looked up and always published.
+    Explicit,
 };
 
-struct PromptCheckpointHint {
-    PromptCheckpointKind kind = PromptCheckpointKind::StablePrefix;
-    std::uint32_t boundary    = 0;
+struct PromptBoundary {
+    std::uint32_t depth     = 0;
+    PromptBoundaryKind kind = PromptBoundaryKind::SystemTools;
+    bool publish            = false;
 };
 
 struct PromptIdentity {
     bool reusable = true;
-    std::optional<std::uint32_t> stable_prefix_boundary;
-    // Kept as the single policy-selected rewrite frontier for existing execution paths.
+    // The policy-selected rewrite frontier: the lane ends the request holding its turn
+    // checkpoint here.
     std::optional<std::uint32_t> turn_rewrite_boundary;
     // Opener of the last real user query; sits before that message's content so it survives a
     // client rewriting the message tail (floating synthetic reminders).
     std::optional<std::uint32_t> user_turn_boundary;
-    // Ordered semantic candidates let cache layers retain the stable anchors and rolling history.
-    std::vector<PromptCheckpointHint> checkpoint_hints;
+    // Strictly ascending by depth. None lies past `turn_rewrite_boundary` when it exists.
+    std::vector<PromptBoundary> boundaries;
 };
 
 struct PrepareStats {

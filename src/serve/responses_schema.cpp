@@ -180,6 +180,34 @@ struct ParsedMessage {
     Json canonical;
 };
 
+// A block-level `prompt_cache_breakpoint` marks the end of the block as a content-addressed
+// prompt-cache boundary. Only `{"mode": "explicit"}` exists; an implicit boundary is placed by
+// the server, so asking for one on a block is a contradiction.
+bool parse_prompt_cache_breakpoint(const Json& block, const std::string& where) {
+    if (!block.contains("prompt_cache_breakpoint") ||
+        block.at("prompt_cache_breakpoint").is_null()) {
+        return false;
+    }
+    const Json& breakpoint = block.at("prompt_cache_breakpoint");
+    if (!breakpoint.is_object()) {
+        bad_request(where + ".prompt_cache_breakpoint must be an object", "input");
+    }
+    for (auto it = breakpoint.begin(); it != breakpoint.end(); ++it) {
+        if (it.key() != "mode") {
+            bad_request(where + ".prompt_cache_breakpoint." + it.key() + " is not supported",
+                        "input", "parameter_not_supported");
+        }
+    }
+    if (!breakpoint.contains("mode") || !breakpoint.at("mode").is_string() ||
+        breakpoint.at("mode").get<std::string>() != "explicit") {
+        bad_request(where + ".prompt_cache_breakpoint.mode must be 'explicit'", "input",
+                    "invalid_value");
+    }
+    return true;
+}
+
+Json canonical_prompt_cache_breakpoint() { return Json{{"mode", "explicit"}}; }
+
 ParsedMessage parse_message_item(const Json& item, std::size_t index) {
     reject_unknown_non_null_fields(item, {"id", "type", "role", "content", "status", "phase"},
                                    "input.message");
@@ -206,20 +234,25 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
     ParsedMessage parsed;
     parsed.turn.role       = role;
     Json content           = Json::array();
-    const auto append_text = [&](const std::string& text, const std::string& wire_type) {
+    const auto append_text = [&](const std::string& text, const std::string& wire_type,
+                                 bool cache_breakpoint) {
         ContentPart part;
-        part.kind     = ContentKind::Text;
-        part.text     = text;
-        part.type_raw = wire_type;
+        part.kind             = ContentKind::Text;
+        part.text             = text;
+        part.type_raw         = wire_type;
+        part.cache_breakpoint = cache_breakpoint;
         parsed.turn.content.push_back(std::move(part));
         Json canonical = {{"type", wire_type}, {"text", text}};
         if (wire_type == "output_text") { canonical["annotations"] = Json::array(); }
+        if (cache_breakpoint) {
+            canonical["prompt_cache_breakpoint"] = canonical_prompt_cache_breakpoint();
+        }
         content.push_back(std::move(canonical));
     };
 
     if (item.at("content").is_string()) {
         append_text(item.at("content").get<std::string>(),
-                    role == "assistant" ? "output_text" : "input_text");
+                    role == "assistant" ? "output_text" : "input_text", false);
     } else if (item.at("content").is_array()) {
         for (const Json& value : item.at("content")) {
             if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
@@ -227,8 +260,9 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
             }
             const std::string type = value.at("type").get<std::string>();
             if (type == "input_text" || type == "output_text") {
-                reject_unknown_non_null_fields(value, {"type", "text", "annotations", "logprobs"},
-                                               "input.message.content");
+                reject_unknown_non_null_fields(
+                    value, {"type", "text", "annotations", "logprobs", "prompt_cache_breakpoint"},
+                    "input.message.content");
                 if (!value.contains("text") || !value.at("text").is_string()) {
                     bad_request(type + " must contain a string text", "input");
                 }
@@ -243,7 +277,8 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
                 // Empty output metadata arrays are emitted on replay by common AI SDK clients.
                 require_empty_array_noop(value, "annotations", "input.message.content");
                 require_empty_array_noop(value, "logprobs", "input.message.content");
-                append_text(value.at("text").get<std::string>(), type);
+                append_text(value.at("text").get<std::string>(), type,
+                            parse_prompt_cache_breakpoint(value, "input.message.content"));
             } else if (type == "input_image") {
                 reject_unknown_non_null_fields(value, {"type", "image_url", "file_id", "detail"},
                                                "input.message.content");
@@ -416,17 +451,23 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
             }
             const std::string type = value.at("type").get<std::string>();
             if (type == "input_text") {
-                reject_unknown_non_null_fields(value, {"type", "text"},
+                reject_unknown_non_null_fields(value, {"type", "text", "prompt_cache_breakpoint"},
                                                "input.function_call_output.output");
                 if (!value.contains("text") || !value.at("text").is_string()) {
                     bad_request("input_text must contain a string text", "input");
                 }
                 ContentPart content;
-                content.kind     = ContentKind::Text;
-                content.type_raw = type;
-                content.text     = value.at("text").get<std::string>();
+                content.kind             = ContentKind::Text;
+                content.type_raw         = type;
+                content.text             = value.at("text").get<std::string>();
+                content.cache_breakpoint = parse_prompt_cache_breakpoint(
+                    value, "input.function_call_output.output");
+                Json canonical_part = {{"type", type}, {"text", value.at("text")}};
+                if (content.cache_breakpoint) {
+                    canonical_part["prompt_cache_breakpoint"] = canonical_prompt_cache_breakpoint();
+                }
                 turn.content.push_back(std::move(content));
-                canonical_output.push_back(Json{{"type", type}, {"text", value.at("text")}});
+                canonical_output.push_back(std::move(canonical_part));
             } else if (type == "input_image") {
                 reject_unknown_non_null_fields(value, {"type", "image_url", "file_id", "detail"},
                                                "input.function_call_output.output");
@@ -546,6 +587,17 @@ void parse_input(const Json& input, ResponsesRequest& out) {
     }
     if (pending_reasoning_present) {
         bad_request("a reasoning Item must be followed by an assistant output Item", "input");
+    }
+    std::size_t breakpoints = 0;
+    for (const ChatTurn& turn : out.input_turns) {
+        for (const ContentPart& part : turn.content) {
+            breakpoints += part.cache_breakpoint ? 1 : 0;
+        }
+    }
+    if (breakpoints > kMaxPromptCacheBreakpoints) {
+        bad_request("at most " + std::to_string(kMaxPromptCacheBreakpoints) +
+                        " prompt_cache_breakpoint markers are allowed per request",
+                    "input", "too_many_prompt_cache_breakpoints");
     }
 }
 
@@ -729,7 +781,7 @@ void reject_unknown_top_level(const Json& body) {
 void reject_server_managed_features(const Json& body) {
     for (const char* key :
          {"context_management", "conversation", "max_tool_calls", "moderation", "prompt",
-          "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "user"}) {
+          "prompt_cache_retention", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -851,6 +903,30 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
         out.prompt_cache_key = body.at("prompt_cache_key").get<std::string>();
         out.generation.prompt_cache_routing_hint = out.prompt_cache_key;
+    }
+    if (body.contains("prompt_cache_options") && !body.at("prompt_cache_options").is_null()) {
+        const Json& options = body.at("prompt_cache_options");
+        if (!options.is_object()) {
+            bad_request("prompt_cache_options must be an object", "prompt_cache_options");
+        }
+        for (auto it = options.begin(); it != options.end(); ++it) {
+            if (it.key() == "mode" || it.value().is_null()) { continue; }
+            // Retention is the server's continuation-cache idle timers, not a per-request
+            // choice.
+            bad_request("prompt_cache_options." + it.key() + " is not supported",
+                        "prompt_cache_options", "parameter_not_supported");
+        }
+        if (options.contains("mode") && !options.at("mode").is_null()) {
+            const Json& mode = options.at("mode");
+            if (mode.is_string() && mode.get<std::string>() == "explicit") {
+                out.generation.prompt_cache_mode = ninfer::PromptCacheMode::Explicit;
+            } else if (mode.is_string() && mode.get<std::string>() == "implicit") {
+                out.generation.prompt_cache_mode = ninfer::PromptCacheMode::Implicit;
+            } else {
+                bad_request("prompt_cache_options.mode must be 'implicit' or 'explicit'",
+                            "prompt_cache_options", "invalid_value");
+            }
+        }
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
@@ -1034,9 +1110,13 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     const int observed_cached = std::max(runtime.cached_input_tokens,
                                          static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
     const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
+    const int cache_write_tokens =
+        std::clamp(static_cast<int>(outcome.metrics.continuation.cache_write_tokens), 0,
+                   outcome.prompt_tokens - cached_tokens);
     response["usage"]         = Json{
                 {"input_tokens", outcome.prompt_tokens},
-                {"input_tokens_details", Json{{"cached_tokens", cached_tokens}, {"cache_write_tokens", 0}}},
+                {"input_tokens_details", Json{{"cached_tokens", cached_tokens},
+                                              {"cache_write_tokens", cache_write_tokens}}},
                 {"output_tokens", outcome.completion_tokens},
                 {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
                 {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};

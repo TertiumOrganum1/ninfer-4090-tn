@@ -724,10 +724,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          *request_plan.turn_checkpoint_capture_frontier >= prompt_tokens)) {
         throw std::logic_error("planned turn checkpoint capture frontier is invalid");
     }
-    if (request_plan.stable_checkpoint_capture_frontier &&
-        (*request_plan.stable_checkpoint_capture_frontier <= request_plan.reuse_base ||
-         *request_plan.stable_checkpoint_capture_frontier > prompt_tokens)) {
-        throw std::logic_error("planned stable checkpoint capture frontier is invalid");
+    {
+        std::uint32_t previous_frontier = request_plan.reuse_base;
+        for (const std::uint32_t frontier : request_plan.capture_frontiers) {
+            if (frontier <= previous_frontier || frontier > prompt_tokens) {
+                throw std::logic_error("planned boundary capture frontier is invalid");
+            }
+            previous_frontier = frontier;
+        }
     }
 
     const auto started       = Clock::now();
@@ -743,7 +747,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.lifecycle = Lifecycle::Empty;
     sequence.adapter  = request_plan.adapter;
     sequence.retained = false;
-    sequence.stable_continuation.reset();
+    sequence.captured_continuations.clear();
     try {
         if (checkpoint_ring_capacity != 0) {
             // Settle the staged checkpoint and the ring against this request's divergence
@@ -881,8 +885,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .transient                        = transient,
             .turn_checkpoint_capture_frontier = request_plan.turn_checkpoint_capture_frontier,
             .user_turn_capture_frontier       = request_plan.user_turn_capture_frontier,
-            .stable_checkpoint_capture_frontier =
-                request_plan.stable_checkpoint_capture_frontier,
+            .capture_frontiers                = std::move(request_plan.capture_frontiers),
             .base                             = base,
             .cursor                           = base,
             .prompt_tokens                    = prompt_tokens,
@@ -1451,17 +1454,17 @@ void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     clear_lane(sequences[lane], requests[lane]);
 }
 
-std::optional<std::string>
-ProgramImplCore::stable_prefix_alias(const PreparedPromptData& prompt) const {
+std::vector<PromptBoundaryAlias>
+ProgramImplCore::boundary_aliases(const PreparedPromptData& prompt) const {
     try {
-        return image::stable_alias(continuation_compatibility_key, prompt);
-    } catch (...) { return std::nullopt; }
+        return image::boundary_aliases(continuation_compatibility_key, prompt);
+    } catch (...) { return {}; }
 }
 
-std::optional<cache::ContinuationImage>
-ProgramImplCore::take_stable_continuation_lane(std::uint32_t lane) {
-    if (lane >= max_concurrency) return std::nullopt;
-    return std::exchange(sequences[lane].stable_continuation, std::nullopt);
+std::vector<CapturedContinuation>
+ProgramImplCore::take_captured_continuations_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) return {};
+    return std::exchange(sequences[lane].captured_continuations, {});
 }
 
 cache::ContinuationImage ProgramImplCore::export_stable_continuation(
@@ -1986,26 +1989,27 @@ ContinuationRestoreFailure ProgramImplCore::import_continuation_lane(
             continuation_transfer, device.stream);
         copy_tensor_to_device(sequence.tail_hidden, tail_hidden, continuation_transfer,
                               device.stream);
-        if (boundary.valid) {
-            import_linear_attention_state(
-                decoder->linear_attention,
-                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
-                *checkpoint_gdn, continuation_transfer, device.stream);
-            copy_tensor_to_device(sequence.turn_checkpoint_hidden, *checkpoint_hidden,
-                                  continuation_transfer, device.stream);
-        }
+        // A prefix-only image is exactly the state a turn checkpoint at its frontier would hold,
+        // so the lane adopts it as one. Without that, a restore landing exactly on the prompt's
+        // rewrite frontier - the common case for a turn-opener boundary - would have no
+        // checkpoint there and planning would reset it to a cold prefill.
+        import_linear_attention_state(
+            decoder->linear_attention,
+            LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+            boundary.valid ? *checkpoint_gdn : current_gdn, continuation_transfer, device.stream);
+        copy_tensor_to_device(sequence.turn_checkpoint_hidden,
+                              boundary.valid ? *checkpoint_hidden : tail_hidden,
+                              continuation_transfer, device.stream);
         if (dflash_backend) {
             if (!dflash || !dflash_local) {
                 throw std::invalid_argument("DFlash continuation state is incomplete");
             }
             import_cyclic_kv_lane(dflash->local, static_cast<std::int32_t>(sequence.lane),
                                    *dflash_local, continuation_transfer, device.stream);
-            if (boundary.valid) {
-                import_cyclic_kv_lane(dflash->turn_checkpoint_local,
-                                      static_cast<std::int32_t>(sequence.lane),
-                                       *dflash_checkpoint_local, continuation_transfer,
-                                       device.stream);
-            }
+            import_cyclic_kv_lane(dflash->turn_checkpoint_local,
+                                  static_cast<std::int32_t>(sequence.lane),
+                                  boundary.valid ? *dflash_checkpoint_local : *dflash_local,
+                                  continuation_transfer, device.stream);
         }
         device.synchronize();
 
@@ -2021,8 +2025,8 @@ ContinuationRestoreFailure ProgramImplCore::import_continuation_lane(
         std::copy(metadata.mtp_drafts.begin(), metadata.mtp_drafts.end(),
                   sequence.mtp_drafts.begin());
         sequence.tail_hidden_valid = true;
-        sequence.turn_checkpoint =
-            TurnCheckpoint{.valid = boundary.valid, .frontier = boundary.frontier};
+        sequence.turn_checkpoint   = TurnCheckpoint{
+              .valid = true, .frontier = boundary.valid ? boundary.frontier : frontier};
         // A continuation image carries no user-turn anchor. Leaving the previous occupant's
         // anchor in place would let prefix_matches accept it against the newly restored ledger
         // and splice in another conversation's recurrent state.
@@ -2068,7 +2072,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.user_turn_anchor        = {};
     sequence.checkpoint_ring.clear();
     discard_checkpoint_staging(sequence);
-    sequence.stable_continuation.reset();
+    sequence.captured_continuations.clear();
     request.pending                  = {};
 }
 
@@ -2918,8 +2922,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             schedule::PrefillChunkResult result;
             const std::optional<std::uint32_t> capture_frontier =
-                image::next_prefill_checkpoint(staged.cursor,
-                                               staged.stable_checkpoint_capture_frontier,
+                image::next_prefill_checkpoint(staged.cursor, staged.capture_frontiers,
                                                staged.turn_checkpoint_capture_frontier,
                                                staged.user_turn_capture_frontier);
             if (staged.vision) {
@@ -2961,11 +2964,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.user_turn_capture_frontier.reset();
             }
 
-            if (staged.stable_checkpoint_capture_frontier &&
-                staged.cursor == *staged.stable_checkpoint_capture_frontier) {
-                sequence.stable_continuation = export_stable_continuation(
-                    sequence, staged.prompt, staged.cursor);
-                staged.stable_checkpoint_capture_frontier.reset();
+            if (!staged.capture_frontiers.empty() &&
+                staged.cursor == staged.capture_frontiers.front()) {
+                sequence.captured_continuations.push_back(CapturedContinuation{
+                    .depth = staged.cursor,
+                    .image = export_stable_continuation(sequence, staged.prompt, staged.cursor)});
+                staged.capture_frontiers.erase(staged.capture_frontiers.begin());
             }
 
             if (!result.finalized) {

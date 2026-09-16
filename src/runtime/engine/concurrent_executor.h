@@ -219,9 +219,8 @@ public:
         try {
             CachedContinuation routed_continuation;
             std::optional<PendingSessionPublication> pending_session_publication;
-            std::optional<std::string> stable_alias;
+            std::vector<StableBoundary> boundaries;
             CachedContinuation stable_continuation;
-            std::optional<std::uint32_t> stable_boundary;
             if (continuation_lookup_enabled(static_cast<bool>(continuation_cache_),
                                             options.execution.allow_prefix_reuse)) {
                 if (options.routing_hint) {
@@ -240,16 +239,23 @@ public:
                         pending_session_publication = publication_after;
                     }
                 }
-                stable_alias = instance_.program->stable_prefix_alias(prompt);
-                if (stable_alias) { stable_alias = adapter_scoped_alias(adapter_scope, *stable_alias); }
-                stable_boundary = targets::qwen3_8::PreparedPromptAccess::view(prompt)
-                                      .identity.stable_prefix_boundary;
-                if (stable_alias) {
+                for (targets::qwen3_8::PromptBoundaryAlias& boundary :
+                     instance_.program->boundary_aliases(prompt)) {
                     // Descriptors only. Materialising here would put a full L3 image read plus
                     // verification on the caller's thread, ahead of the queue, for a prefix that
                     // may not even beat what a lane already holds.
-                    stable_continuation = lookup_continuation(
-                        *stable_alias, ContinuationAliasKind::StablePrefix, false, true);
+                    StableBoundary entry{.depth   = boundary.depth,
+                                         .publish = boundary.publish,
+                                         .alias   = adapter_scoped_alias(adapter_scope,
+                                                                         boundary.alias)};
+                    CachedContinuation lookup = lookup_continuation(
+                        entry.alias, ContinuationAliasKind::StablePrefix, false, true);
+                    const bool unpublished =
+                        entry.publish && !lookup.image && lookup.candidates.empty();
+                    entry.completion_publish = unpublished && boundary.rewrite_frontier;
+                    entry.flight_needed      = unpublished && !boundary.rewrite_frontier;
+                    merge_stable_lookup(stable_continuation, std::move(lookup));
+                    boundaries.push_back(std::move(entry));
                 }
             }
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
@@ -264,9 +270,8 @@ public:
                 request_id, std::move(prompt), std::move(output), prompt_summary, prepare_seconds,
                 std::move(options), pending_deadline, submitted, std::move(host_input),
                 std::move(routed_continuation), std::move(stable_continuation),
-                std::move(stable_alias), stable_boundary,
-                std::move(pending_session_publication));
-            initialize_stable_flight(request);
+                std::move(boundaries), std::move(pending_session_publication));
+            acquire_stable_flights(request, false);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -276,7 +281,7 @@ public:
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
                 --outstanding_;
-                release_stable_builder(request);
+                release_stable_builders(request);
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
@@ -556,6 +561,42 @@ private:
         cache::CacheLookupStatus status = cache::CacheLookupStatus::Absent;
         std::uint64_t lookup_microseconds = 0;
     };
+
+    // One content-addressed boundary of a request's prompt. Every boundary was looked up at
+    // submission; a `publish` boundary that missed needs a write-once flight, which this request
+    // either builds (captures and publishes the image) or follows (waits for its builder).
+    struct StableBoundary {
+        std::uint32_t depth = 0;
+        bool publish        = false;
+        std::string alias; // adapter-scoped
+        // The last lookup found nothing and the boundary publishes, so someone must build it.
+        bool flight_needed = false;
+        bool builder       = false;
+        // A captured image is queued; the publication worker releases the flight when it lands.
+        bool publication_pending = false;
+        // The boundary is the lane's turn-rewrite frontier, where the lane holds its turn
+        // checkpoint through decode. Its image is the completed lane's image, published at
+        // completion like a session head; nothing is captured for it during prefill and no flight
+        // guards it, because a follower would otherwise wait on this request's whole decode.
+        bool completion_publish = false;
+    };
+
+    // Descriptors from every boundary lookup (history lookups carry descriptors, never an image)
+    // pool into one candidate list, deepest first, so the restore ranks them as one set. Status
+    // carries the worst outcome seen: an unavailable entry stays reportable even when a
+    // shallower boundary hit.
+    static void merge_stable_lookup(CachedContinuation& pool, CachedContinuation&& lookup) {
+        pool.lookup_microseconds += lookup.lookup_microseconds;
+        pool.alias_kind = ContinuationAliasKind::StablePrefix;
+        if (lookup.status == cache::CacheLookupStatus::UnavailableOrCorrupt ||
+            pool.status == cache::CacheLookupStatus::Absent) {
+            pool.status = lookup.status;
+        }
+        // Boundaries arrive ascending by depth; the pool is kept deepest first.
+        pool.candidates.insert(pool.candidates.begin(),
+                               std::make_move_iterator(lookup.candidates.begin()),
+                               std::make_move_iterator(lookup.candidates.end()));
+    }
 
     enum class PublicationStatus : std::uint8_t { Pending, Success, Failed, Superseded };
     using PublicationTicket = std::shared_ptr<std::atomic<PublicationStatus>>;
@@ -1254,18 +1295,16 @@ private:
                 Clock::time_point limit, Clock::time_point submit_time, HostInputLease input_lease,
                  CachedContinuation routed_cached_continuation,
                  CachedContinuation stable_cached_continuation,
-                 std::optional<std::string> shared_stable_alias,
-                  std::optional<std::uint32_t> shared_stable_boundary,
-                  std::optional<PendingSessionPublication> pending_publication)
+                 std::vector<StableBoundary> prompt_boundaries,
+                 std::optional<PendingSessionPublication> pending_publication)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
               deadline(limit), submitted(submit_time),
               routed_continuation(std::move(routed_cached_continuation)),
-               stable_continuation(std::move(stable_cached_continuation)),
-               stable_alias(std::move(shared_stable_alias)),
-                stable_boundary(shared_stable_boundary),
-                pending_session_publication(std::move(pending_publication)) {
+              stable_continuation(std::move(stable_cached_continuation)),
+              boundaries(std::move(prompt_boundaries)),
+              pending_session_publication(std::move(pending_publication)) {
             continuation.lookup_microseconds = routed_continuation.lookup_microseconds +
                                                stable_continuation.lookup_microseconds;
             if (!options.execution.allow_prefix_reuse) {
@@ -1273,8 +1312,9 @@ private:
             } else {
                 continuation.alias_kind = options.routing_hint
                                               ? ContinuationAliasKind::Session
-                                              : (stable_alias ? ContinuationAliasKind::StablePrefix
-                                                              : ContinuationAliasKind::None);
+                                              : (!boundaries.empty()
+                                                     ? ContinuationAliasKind::StablePrefix
+                                                     : ContinuationAliasKind::None);
                 const bool any_candidate =
                     routed_continuation.image || !routed_continuation.candidates.empty() ||
                     stable_continuation.image || !stable_continuation.candidates.empty();
@@ -1327,9 +1367,12 @@ private:
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
         CachedContinuation routed_continuation;
+        // Pooled descriptors from every boundary lookup; the restore ranks them as one set.
         CachedContinuation stable_continuation;
-        std::optional<std::string> stable_alias;
-        std::optional<std::uint32_t> stable_boundary;
+        // Ascending by depth.
+        std::vector<StableBoundary> boundaries;
+        // Deepest boundary this request captured and queued for publication.
+        std::uint32_t deepest_published_depth = 0;
         bool continuation_restore_attempted = false;
         // Set when the only thing that stopped a restore was shared-KV capacity. That is a
         // transient condition owned by whichever requests currently hold pages, so the candidate
@@ -1342,9 +1385,6 @@ private:
         std::uint64_t continuation_l2_restore_operations = 0;
         std::uint64_t continuation_l3_restore_microseconds = 0;
         std::uint64_t continuation_l3_restore_operations = 0;
-        bool stable_flight_builder           = false;
-        bool stable_flight_resolved          = false;
-        bool stable_publication_pending      = false;
         ContinuationDiagnostics continuation;
 
         std::optional<BasePlan> base_plan;
@@ -1457,70 +1497,79 @@ private:
         for (auto& plan : request->lane_plans) { plan.reset(); }
     }
 
-    [[nodiscard]] bool stable_flight_needed(const Request& request) const noexcept {
-        return request.stable_alias && !request.stable_continuation.image &&
-               request.stable_continuation.candidates.empty();
-    }
-
-    void initialize_stable_flight(const std::shared_ptr<Request>& request) {
-        request->stable_flight_resolved = !stable_flight_needed(*request);
-        if (request->stable_flight_resolved) { return; }
-        std::lock_guard lock(stable_flight_mutex_);
-        request->stable_flight_builder =
-            stable_flights_.acquire(*request->stable_alias, request->id) ==
-            StablePrefixFlights::AcquireResult::Builder;
-    }
-
-    void release_stable_builder(const std::shared_ptr<Request>& request) noexcept {
-        if (!request || !request->stable_alias || !request->stable_flight_builder ||
-            request->stable_publication_pending) {
-            return;
-        }
-        {
-            std::lock_guard lock(stable_flight_mutex_);
-            (void)stable_flights_.release(*request->stable_alias, request->id);
-        }
-        request->stable_flight_builder = false;
-        queue_cv_.notify_all();
-    }
-
-    void refresh_stable_flights() {
-        const auto queued = pending_snapshot();
-        for (const auto& request : queued) {
-            if (request->stable_flight_resolved || request->stable_flight_builder ||
-                !request->stable_alias) {
-                continue;
-            }
-
+    // Claims the write-once flight of every publish boundary that still needs one, shallowest
+    // first, and stops at the first one another request already builds: the request follows
+    // that boundary and re-tries once its builder finishes. Claiming in depth order is what
+    // keeps two requests from each following a boundary the other holds - both order shared
+    // boundaries identically, since an alias names one exact prefix.
+    //
+    // With `relookup`, a boundary claimed here is looked up again first: its previous builder
+    // may have published since this request last looked, in which case the hit is adopted and
+    // the flight released. The submission call skips that because it just looked.
+    void acquire_stable_flights(const std::shared_ptr<Request>& request, bool relookup) {
+        bool adopted = false;
+        for (StableBoundary& boundary : request->boundaries) {
+            if (!boundary.flight_needed || boundary.builder) { continue; }
             bool became_builder = false;
             {
                 std::lock_guard lock(stable_flight_mutex_);
-                became_builder =
-                    stable_flights_.acquire(*request->stable_alias, request->id) ==
-                    StablePrefixFlights::AcquireResult::Builder;
+                became_builder = stable_flights_.acquire(boundary.alias, request->id) ==
+                                 StablePrefixFlights::AcquireResult::Builder;
             }
-            if (!became_builder) { continue; }
-
-            request->stable_flight_builder = true;
-            CachedContinuation candidate = lookup_continuation(
-                *request->stable_alias, ContinuationAliasKind::StablePrefix, false, true);
-            request->continuation.lookup_microseconds += candidate.lookup_microseconds;
-            if (candidate.candidates.empty()) { continue; }
-
-            request->stable_continuation            = std::move(candidate);
+            if (!became_builder) { break; }
+            boundary.builder = true;
+            if (!relookup) { continue; }
+            CachedContinuation lookup = lookup_continuation(
+                boundary.alias, ContinuationAliasKind::StablePrefix, false, true);
+            request->continuation.lookup_microseconds += lookup.lookup_microseconds;
+            if (lookup.candidates.empty()) { continue; }
+            merge_stable_lookup(request->stable_continuation, std::move(lookup));
+            boundary.flight_needed = false;
+            release_stable_builder(request, boundary);
+            adopted = true;
+        }
+        if (adopted) {
             request->continuation_restore_attempted   = false;
             request->continuation_restore_deferred_kv = false;
-            request->stable_flight_resolved           = true;
-            release_stable_builder(request);
+        }
+        // Lane plans carry the capture depths, which follow the builder roles.
+        for (auto& plan : request->lane_plans) { plan.reset(); }
+    }
+
+    void release_stable_builder(const std::shared_ptr<Request>& request,
+                                StableBoundary& boundary) noexcept {
+        if (!boundary.builder || boundary.publication_pending) { return; }
+        {
+            std::lock_guard lock(stable_flight_mutex_);
+            (void)stable_flights_.release(boundary.alias, request->id);
+        }
+        boundary.builder = false;
+        queue_cv_.notify_all();
+    }
+
+    // Releases every flight this request builds and has not handed to the publication worker.
+    void release_stable_builders(const std::shared_ptr<Request>& request) noexcept {
+        if (!request) { return; }
+        for (StableBoundary& boundary : request->boundaries) {
+            release_stable_builder(request, boundary);
         }
     }
 
+    void refresh_stable_flights() {
+        for (const auto& request : pending_snapshot()) {
+            if (stable_flight_blocked(*request)) { acquire_stable_flights(request, true); }
+        }
+    }
+
+    // A request waits while any publish boundary it needs is being built by another request.
     [[nodiscard]] static bool stable_flight_blocked(const Request& request) noexcept {
-        return !request.stable_flight_resolved && !request.stable_flight_builder;
+        return std::ranges::any_of(request.boundaries, [](const StableBoundary& boundary) {
+            return boundary.flight_needed && !boundary.builder;
+        });
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
-        release_stable_builder(request);
+        release_stable_builders(request);
         release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
@@ -1535,8 +1584,12 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
-        release_stable_builder(request);
+        release_stable_builders(request);
         release_planning_state(request);
+        request->continuation.cache_write_tokens =
+            request->deepest_published_depth > request->continuation.restored_tokens
+                ? request->deepest_published_depth - request->continuation.restored_tokens
+                : 0;
         request->prompt = {};
         request->host_input.reset();
         GenerationResult result;
@@ -1685,35 +1738,55 @@ private:
         lane_provenance_[lane] = completion_publication_provenance(
             lane_provenance_[lane], request->options.routing_hint
                                         ? ContinuationAliasKind::Session
-                                        : (request->stable_alias
+                                        : (!request->boundaries.empty()
                                                ? ContinuationAliasKind::StablePrefix
                                                : request->continuation.alias_kind));
+        lane_sessions_[lane].reset();
         if (!continuation_cache_ || !request->options.execution.allow_prefix_reuse ||
-            reason == FinishReason::Cancelled ||
-            !request->options.routing_hint) {
-            lane_sessions_[lane].reset();
+            reason == FinishReason::Cancelled) {
             return;
         }
-        if (request->session_lookup_deferred) {
-            // The retained lane is newer than the alias that is still being published. Do not
-            // block completion or enqueue a child with a stale CAS parent. A later turn can publish
-            // the newest retained state after the predecessor becomes visible.
-            lane_sessions_[lane].reset();
-            return;
-        }
-        lane_sessions_[lane] = LaneSession{.name          = *request->options.routing_hint,
-                                            .expected_head = request->routed_continuation.id,
-                                            .expected_generation =
-                                                request->routed_continuation.generation};
+        // A deferred session lookup means the retained lane is newer than the alias that is still
+        // being published. Do not block completion or enqueue a child with a stale CAS parent; a
+        // later turn can publish the newest retained state after the predecessor becomes visible.
+        const bool publish_session =
+            request->options.routing_hint && !request->session_lookup_deferred;
+        const auto frontier_boundary =
+            std::ranges::find_if(request->boundaries, [](const StableBoundary& boundary) {
+                return boundary.completion_publish;
+            });
+        const bool publish_boundary = frontier_boundary != request->boundaries.end();
+        if (!publish_session && !publish_boundary) { return; }
         const auto export_started = Clock::now();
         try {
-            auto image                        = instance_.program->export_continuation_lane(lane);
-            image.parent_id                   = lane_sessions_[lane]->expected_head;
-            lane_sessions_[lane]->publication = queue_publication(
-                std::move(image), lane_sessions_[lane]->name, lane_sessions_[lane]->expected_head,
-                lane_sessions_[lane]->expected_generation);
-            request->continuation.completion_publication_queued =
-                static_cast<bool>(lane_sessions_[lane]->publication);
+            // One export serves both aliases. The boundary alias names the exact prefix through
+            // the rewrite frontier, which is this image's turn checkpoint: a request sharing only
+            // that prefix restores the image and rewinds to the checkpoint, and a request sharing
+            // the generated turn as well appends at the frontier.
+            auto image = instance_.program->export_continuation_lane(lane);
+            if (publish_boundary && image.boundary_tokens == frontier_boundary->depth) {
+                auto ticket = queue_publication(publish_session ? image : std::move(image),
+                                                frontier_boundary->alias, std::nullopt,
+                                                std::nullopt, true);
+                if (ticket) {
+                    request->deepest_published_depth =
+                        std::max(request->deepest_published_depth, frontier_boundary->depth);
+                    request->continuation.completion_publication_queued = true;
+                }
+            }
+            if (publish_session) {
+                lane_sessions_[lane] =
+                    LaneSession{.name                = *request->options.routing_hint,
+                                .expected_head       = request->routed_continuation.id,
+                                .expected_generation = request->routed_continuation.generation};
+                image.parent_id                   = lane_sessions_[lane]->expected_head;
+                lane_sessions_[lane]->publication = queue_publication(
+                    std::move(image), lane_sessions_[lane]->name,
+                    lane_sessions_[lane]->expected_head, lane_sessions_[lane]->expected_generation);
+                request->continuation.completion_publication_queued =
+                    request->continuation.completion_publication_queued ||
+                    static_cast<bool>(lane_sessions_[lane]->publication);
+            }
         } catch (...) {
             // A continuation is an optimization; generation has already completed successfully.
         }
@@ -2105,27 +2178,33 @@ private:
         consume_service_work(request, 1);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (continuation_cache_ && request->options.execution.allow_prefix_reuse && request->lane &&
-            request->stable_alias &&
-            request->stable_flight_builder && !request->stable_publication_pending) {
+            !request->boundaries.empty()) {
             try {
-                auto stable = instance_.program->take_stable_continuation_lane(*request->lane);
-                if (stable) {
+                for (targets::qwen3_8::CapturedContinuation& captured :
+                     instance_.program->take_captured_continuations_lane(*request->lane)) {
+                    const auto boundary = std::ranges::find_if(
+                        request->boundaries, [&](const StableBoundary& candidate) {
+                            return candidate.depth == captured.depth && candidate.builder &&
+                                   !candidate.publication_pending;
+                        });
+                    // The plan captures only at depths this request builds, so an image without
+                    // a builder role is a flight released underneath it; dropping it is correct.
+                    if (boundary == request->boundaries.end()) { continue; }
                     auto ticket = queue_publication(
-                        std::move(*stable), *request->stable_alias, std::nullopt, std::nullopt, true,
-                        std::pair<std::string, std::uint64_t>{*request->stable_alias, request->id});
+                        std::move(captured.image), boundary->alias, std::nullopt, std::nullopt,
+                        true, std::pair<std::string, std::uint64_t>{boundary->alias, request->id});
                     if (ticket) {
-                        request->stable_publication_pending = true;
+                        boundary->publication_pending = true;
+                        request->deepest_published_depth =
+                            std::max(request->deepest_published_depth, captured.depth);
                         request->continuation.completion_publication_queued = true;
                     } else {
-                        release_stable_builder(request);
+                        release_stable_builder(request, *boundary);
                     }
                 }
-            } catch (...) { release_stable_builder(request); }
+            } catch (...) { release_stable_builders(request); }
         }
-        if (step.complete && request->stable_flight_builder &&
-            !request->stable_publication_pending) {
-            release_stable_builder(request);
-        }
+        if (step.complete) { release_stable_builders(request); }
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
@@ -2241,6 +2320,17 @@ private:
         if (protection_ && protection_->head_request_id == request->id) { protection_.reset(); }
     }
 
+    // Depths the request captures during prefill: the publish boundaries it builds.
+    [[nodiscard]] static std::vector<std::uint32_t> capture_depths(const Request& request) {
+        std::vector<std::uint32_t> depths;
+        for (const StableBoundary& boundary : request.boundaries) {
+            if (boundary.builder && !boundary.publication_pending) {
+                depths.push_back(boundary.depth);
+            }
+        }
+        return depths;
+    }
+
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
             request->base_plan.emplace(
@@ -2259,8 +2349,8 @@ private:
             return;
         }
         request->lane_plans[lane].reset();
-        request->lane_plans[lane].emplace(
-            instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
+        request->lane_plans[lane].emplace(instance_.program->plan_request_for_lane(
+            lane, request->prompt, *request->base_plan, capture_depths(*request)));
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
@@ -2517,17 +2607,26 @@ private:
             bool routed_ready = false;
             std::uint32_t routed_reusable_depth = 0;
 
-            // The stable prefix is evaluated in two steps. Its descriptor gives a metadata-only
-            // upper bound on reusable depth at no I/O cost; the image itself is materialized only
-            // when that bound could still win. A stable prefix that lives in L3 costs a full disk
-            // read plus verification, and paying that to lose to a routed candidate was the
+            // Boundary candidates are evaluated in two steps. Their descriptors give a
+            // metadata-only upper bound on reusable depth at no I/O cost; an image is
+            // materialized only when its bound could still win, deepest first, and the first
+            // one that verifies is the stable candidate. A prefix that lives in L3 costs a full
+            // disk read plus verification, and paying that to lose to a routed candidate was the
             // single largest avoidable component of TTFT.
             std::uint32_t stable_bound = 0;
+            std::vector<SelectedContinuationCandidate> stable_viable;
             if (!request->stable_continuation.candidates.empty()) {
-                stable_bound = metadata_preflight_depth(
-                    request->stable_continuation.candidates.front(),
-                    ContinuationAliasKind::StablePrefix);
-                if (stable_bound <= best_resident_reuse) { stable_bound = 0; }
+                stable_viable = rank_reusable_candidate_descriptors(
+                    std::span<const cache::SessionCandidateDescriptor>(
+                        request->stable_continuation.candidates),
+                    best_resident_reuse, 0, [&](const auto& item) {
+                        return metadata_preflight_depth(item,
+                                                        ContinuationAliasKind::StablePrefix);
+                    });
+                if (!stable_viable.empty()) {
+                    stable_bound =
+                        static_cast<std::uint32_t>(stable_viable.front().reusable_depth);
+                }
             } else if (request->stable_continuation.image) {
                 stable_bound = request->stable_continuation.image->frontier_tokens >
                                        best_resident_reuse
@@ -2540,25 +2639,41 @@ private:
                 if (stable_exact_depth) { return *stable_exact_depth; }
                 stable_exact_depth = 0;
                 if (stable_bound == 0) { return 0; }
-                if (!request->stable_continuation.image &&
-                    !request->stable_continuation.candidates.empty()) {
+                if (request->stable_continuation.image) {
+                    if (request->stable_continuation.image->frontier_tokens >
+                        best_resident_reuse) {
+                        stable_exact_depth = preflight_depth(*request->stable_continuation.image,
+                                                              ContinuationAliasKind::StablePrefix);
+                    }
+                    return *stable_exact_depth;
+                }
+                for (const auto& viable_item : stable_viable) {
                     const cache::SessionCandidateDescriptor& descriptor =
-                        request->stable_continuation.candidates.front();
+                        request->stable_continuation.candidates[viable_item.index];
                     auto lookup = continuation_cache_->resolve_candidate(descriptor);
                     account_candidate_lookup(request, lookup);
+                    if (!lookup.image) {
+                        if (lookup.status == cache::CacheLookupStatus::UnavailableOrCorrupt) {
+                            observe_continuation_miss(
+                                request->continuation,
+                                ContinuationMissReason::EntryUnavailableOrCorrupt,
+                                ContinuationAliasKind::StablePrefix);
+                        }
+                        continue;
+                    }
+                    const std::uint32_t exact =
+                        preflight_depth(*lookup.image, ContinuationAliasKind::StablePrefix);
+                    if (exact <= best_resident_reuse) { continue; }
                     // Carry the content identity with the image: it is what binds a resolved
                     // image to work done for it elsewhere, such as a prepared decode.
                     request->stable_continuation.id     = descriptor.id;
                     request->stable_continuation.image  = std::move(lookup.image);
                     request->stable_continuation.source = lookup.source;
                     request->stable_continuation.status = lookup.status;
-                    request->stable_continuation.candidates.clear();
+                    stable_exact_depth                  = exact;
+                    break;
                 }
-                if (request->stable_continuation.image &&
-                    request->stable_continuation.image->frontier_tokens > best_resident_reuse) {
-                    stable_exact_depth = preflight_depth(*request->stable_continuation.image,
-                                                          ContinuationAliasKind::StablePrefix);
-                }
+                request->stable_continuation.candidates.clear();
                 return *stable_exact_depth;
             };
             // A routed depth that already reaches the stable prefix's upper bound wins without

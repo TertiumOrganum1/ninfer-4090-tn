@@ -80,7 +80,9 @@ struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     std::optional<std::uint32_t> user_turn_boundary;
-    std::optional<std::uint32_t> stable_prefix_boundary;
+    // Content-addressed boundaries copied from the prompt: strictly ascending, all inside the
+    // prompt and none past the turn-rewrite frontier.
+    std::vector<PromptBoundary> boundaries;
     // Requested LoRA bank index, or -1 for the base weights. Resident KV and GDN state are only
     // reusable by the adapter that produced them.
     std::int32_t adapter    = -1;
@@ -101,7 +103,9 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
     std::optional<std::uint32_t> user_turn_capture_frontier;
     bool keep_user_turn_anchor = false;
-    std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
+    // Boundary depths this request captures a continuation image at, ascending, all past
+    // `reuse_base`.
+    std::vector<std::uint32_t> capture_frontiers;
     ops::SamplingConfig sampling;
     std::int32_t adapter                      = -1;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -244,7 +248,9 @@ struct SequenceState {
     // Host ring of past turn checkpoints, ascending by frontier. Populated only when the
     // Program was planned with a non-zero turn checkpoint ring.
     std::vector<HostTurnCheckpoint> checkpoint_ring;
-    std::optional<cache::ContinuationImage> stable_continuation;
+    // Images captured at boundary frontiers during the current prefill, ascending by depth,
+    // awaiting the engine to drain them for publication.
+    std::vector<CapturedContinuation> captured_continuations;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -267,7 +273,8 @@ struct RequestControl {
         runtime::TransientRegion transient;
         std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
         std::optional<std::uint32_t> user_turn_capture_frontier;
-        std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
+        // Remaining boundary capture frontiers, ascending; the front is popped when crossed.
+        std::vector<std::uint32_t> capture_frontiers;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -294,7 +301,8 @@ public:
                       const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
-                                                    const RequestBasePlan& base);
+                                                    const RequestBasePlan& base,
+                                                    std::span<const std::uint32_t> capture_depths);
     // LoRA residency. `SequenceState::adapter` is a pool index - the adapter's identity, stable
     // for the process - while the device bank holds a bounded number of slots. This resolves one
     // to the other, staging the adapter over the least recently used slot that no generating
@@ -343,10 +351,10 @@ public:
         std::uint32_t lane, const RequestPlanImpl& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
-    [[nodiscard]] std::optional<std::string>
-    stable_prefix_alias(const PreparedPromptData& prompt) const;
-    [[nodiscard]] std::optional<cache::ContinuationImage>
-    take_stable_continuation_lane(std::uint32_t lane);
+    [[nodiscard]] std::vector<PromptBoundaryAlias>
+    boundary_aliases(const PreparedPromptData& prompt) const;
+    [[nodiscard]] std::vector<CapturedContinuation>
+    take_captured_continuations_lane(std::uint32_t lane);
     [[nodiscard]] std::uint32_t preflight_continuation_metadata(
         const cache::SessionCandidateDescriptor& candidate,
         const PreparedPromptData& prompt) const noexcept;

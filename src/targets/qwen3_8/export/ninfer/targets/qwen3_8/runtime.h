@@ -45,6 +45,25 @@ struct RetainedSessionSnapshot {
     std::string session_digest;
 };
 
+// One prompt boundary with its content-addressed continuation alias. Every entry is a lookup
+// candidate. A `publish` entry below the rewrite frontier is captured during prefill by the
+// request that builds it; the entry at the rewrite frontier is where the lane keeps its turn
+// checkpoint through decode, so its image is the completed lane's image (`export_continuation_lane`)
+// and nothing is captured for it during prefill.
+struct PromptBoundaryAlias {
+    std::uint32_t depth     = 0;
+    PromptBoundaryKind kind = PromptBoundaryKind::SystemTools;
+    bool publish            = false;
+    bool rewrite_frontier   = false;
+    std::string alias;
+};
+
+// A complete continuation image captured at one prompt boundary during prefill.
+struct CapturedContinuation {
+    std::uint32_t depth = 0;
+    cache::ContinuationImage image;
+};
+
 namespace detail {
 template <class Variant>
 struct SequencePlanImpl;
@@ -164,9 +183,12 @@ public:
     [[nodiscard]] RequestBasePlan<Variant>
     plan_request_base(const PreparedPrompt& prompt,
                       const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
-                                                             const RequestBasePlan<Variant>& base);
+    // `capture_depths` are the boundary depths this request builds (ascending); the plan captures
+    // those that lie beyond the lane's reused prefix.
+    [[nodiscard]] RequestPlan<Variant>
+    plan_request_for_lane(std::uint32_t lane, const PreparedPrompt& prompt,
+                          const RequestBasePlan<Variant>& base,
+                          std::span<const std::uint32_t> capture_depths);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool
@@ -212,10 +234,13 @@ public:
         std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
-    [[nodiscard]] std::optional<std::string>
-    stable_prefix_alias(const PreparedPrompt& prompt) const;
-    [[nodiscard]] std::optional<cache::ContinuationImage>
-    take_stable_continuation_lane(std::uint32_t lane);
+    // The prompt's content-addressed boundaries, ascending by depth, each with its alias. Empty
+    // for a prompt that is not reusable.
+    [[nodiscard]] std::vector<PromptBoundaryAlias>
+    boundary_aliases(const PreparedPrompt& prompt) const;
+    // Drains the images the lane captured so far during its prefill, ascending by depth.
+    [[nodiscard]] std::vector<CapturedContinuation>
+    take_captured_continuations_lane(std::uint32_t lane);
     // Metadata preflight is a negative filter and upper bound only. A nonzero result never
     // authorizes import without resolving and exactly preflighting the complete image.
     [[nodiscard]] std::uint32_t preflight_continuation_metadata(

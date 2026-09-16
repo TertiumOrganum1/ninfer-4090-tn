@@ -174,6 +174,7 @@ CompletionUsage usage_with_timings(const GenerationOutcome& outcome) {
     usage.decode_seconds    = outcome.metrics.decode_seconds;
     usage.ttft_seconds      = outcome.metrics.ttft_seconds;
     usage.cache_hit_tokens  = outcome.metrics.prefix_cache_hit_tokens;
+    usage.cache_write_tokens = outcome.metrics.continuation.cache_write_tokens;
     usage.draft_tokens      = outcome.metrics.speculative_draft_tokens;
     usage.accepted_tokens   = outcome.metrics.speculative_accepted_tokens;
     usage.id_slot           = outcome.id_slot;
@@ -1347,7 +1348,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = usage_with_timings(outcome);
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,
@@ -1459,7 +1460,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
                 write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens));
+                                  make_message_delta(stop_reason, usage_with_timings(outcome)));
                 write_stream_item(sink, *stream, make_message_stop());
                 sink.done();
                 return true;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/types.h"
 #include "product/media_acquire/source.h"
 
 // Internal, wire-format-independent representation of a generation request.
@@ -57,6 +58,8 @@ struct CompletionUsage {
     double decode_seconds     = 0.0;
     double ttft_seconds       = 0.0;
     std::int64_t cache_hit_tokens  = 0;
+    // Prompt tokens this request captured for content-addressed reuse beyond what it restored.
+    std::int64_t cache_write_tokens = 0;
     std::uint64_t draft_tokens     = 0;
     std::uint64_t accepted_tokens  = 0;
 
@@ -80,7 +83,13 @@ struct ContentPart {
     std::string text;     // populated for Text
     std::string type_raw; // original OpenAI "type" string (diagnostics / future use)
     ninfer::product::media_acquire::Source source;
+    // Client prompt-cache breakpoint at the end of this part (OpenAI `prompt_cache_breakpoint`,
+    // Anthropic `cache_control`).
+    bool cache_breakpoint = false;
 };
+
+// Both wire contracts allow this many breakpoints per request.
+constexpr std::size_t kMaxPromptCacheBreakpoints = 4;
 
 struct ToolDefinition {
     std::string name;
@@ -193,6 +202,7 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     std::optional<std::string> prompt_cache_routing_hint;
+    ninfer::PromptCacheMode prompt_cache_mode = ninfer::PromptCacheMode::Implicit;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

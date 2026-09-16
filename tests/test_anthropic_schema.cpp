@@ -374,6 +374,77 @@ int test_tool_use_result_roundtrip() {
     return failures;
 }
 
+int test_cache_control_breakpoints() {
+    int failures       = 0;
+    const Json control = Json{{"type", "ephemeral"}};
+    const Json tool    = Json{{"name", "get_weather"},
+                           {"input_schema", Json{{"type", "object"}}},
+                           {"cache_control", control}};
+    const Json system  = Json::array({Json{{"type", "text"}, {"text", "rules"}, {"cache_control", control}}});
+    const Json history = Json{
+        {"role", "user"},
+        {"content", Json::array({Json{{"type", "text"}, {"text", "first"}},
+                                 Json{{"type", "text"}, {"text", "second"}, {"cache_control", control}}})}};
+    const Json assistant = Json{{"role", "assistant"},
+                                {"content", Json::array({Json{{"type", "text"},
+                                                              {"text", "reply"},
+                                                              {"cache_control", control}},
+                                                         Json{{"type", "tool_use"},
+                                                              {"id", "toolu_1"},
+                                                              {"name", "get_weather"},
+                                                              {"input", Json::object()}}})}};
+    const Json result = Json{{"role", "user"},
+                             {"content", Json::array({Json{{"type", "tool_result"},
+                                                           {"tool_use_id", "toolu_1"},
+                                                           {"content", "sunny"},
+                                                           {"cache_control", control}}})}};
+    Json body = {{"model", "m"},
+                 {"max_tokens", 8},
+                 {"system", system},
+                 {"tools", Json::array({tool})},
+                 {"messages", Json::array({history, assistant, result})}};
+
+    // system + tools + two message breakpoints is the limit; the tool result is a fifth.
+    failures += check(api_code([&] { (void)parse_messages_request(body, default_limits()); }) ==
+                          "too_many_cache_control_breakpoints",
+                      "fifth cache_control breakpoint accepted");
+    body["messages"][2]["content"][0].erase("cache_control");
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    // system, user, assistant, tool
+    failures += check(req.messages.size() == 4 && !req.messages[0].content[0].cache_breakpoint,
+                      "system/tools cache_control changed the leading turn");
+    failures += check(req.messages[1].content.size() == 2 &&
+                          !req.messages[1].content[0].cache_breakpoint &&
+                          req.messages[1].content[1].cache_breakpoint,
+                      "user block cache_control not carried onto its part");
+    failures += check(req.messages[2].content.size() == 1 &&
+                          req.messages[2].content[0].cache_breakpoint,
+                      "assistant text cache_control not carried");
+    failures += check(req.messages[3].role == "tool" &&
+                          !req.messages[3].content[0].cache_breakpoint,
+                      "removed tool_result cache_control still marked");
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.options.prompt_cache_mode == ninfer::PromptCacheMode::Implicit &&
+                          prompt.messages[1].parts.back().cache_breakpoint &&
+                          !prompt.messages[1].parts.front().cache_breakpoint,
+                      "breakpoint did not reach the prompt input part");
+
+    body["messages"][2]["content"][0]["cache_control"] = Json{{"type", "ephemeral"}, {"ttl", "1h"}};
+    body["system"][0].erase("cache_control");
+    failures += check(api_code([&] { (void)parse_messages_request(body, default_limits()); }) ==
+                          "parameter_not_supported",
+                      "cache_control.ttl accepted");
+    body["messages"][2]["content"][0]["cache_control"] = Json{{"type", "persistent"}};
+    failures += check(api_code([&] { (void)parse_messages_request(body, default_limits()); }) ==
+                          "invalid_value",
+                      "non-ephemeral cache_control accepted");
+    body["messages"][2]["content"][0]["cache_control"] = control;
+    const GenerationRequest tool_marked = parse_messages_request(body, default_limits());
+    failures += check(tool_marked.messages[3].content[0].cache_breakpoint,
+                      "tool_result cache_control not carried");
+    return failures;
+}
+
 int test_thinking_and_sampling() {
     int failures                = 0;
     Json body                   = {{"model", "m"},
@@ -527,6 +598,23 @@ int test_response_serialization() {
     failures += check(resp.at("stop_sequence").is_null(), "stop_sequence null");
     failures += check(resp.at("usage").at("input_tokens") == 7, "input_tokens");
     failures += check(resp.at("usage").at("output_tokens") == 3, "output_tokens");
+    failures += check(resp.at("usage").at("cache_read_input_tokens") == 0 &&
+                          resp.at("usage").at("cache_creation_input_tokens") == 0,
+                      "usage without cache activity");
+
+    // Cache reads and writes are carved out of input_tokens; the three sum to the prompt, and
+    // a write is clamped to what the read left over.
+    CompletionUsage cached;
+    cached.prompt_tokens      = 10;
+    cached.completion_tokens  = 1;
+    cached.cache_hit_tokens   = 8;
+    cached.cache_write_tokens = 5;
+    const Json cached_resp = Json::parse(
+        make_messages_response("msg_3", "m", "x", "", {}, "end_turn", cached));
+    failures += check(cached_resp.at("usage").at("input_tokens") == 0 &&
+                          cached_resp.at("usage").at("cache_read_input_tokens") == 8 &&
+                          cached_resp.at("usage").at("cache_creation_input_tokens") == 2,
+                      "cached usage split");
     const Json& content = resp.at("content");
     failures += check(content.size() == 3, "thinking + text + tool_use blocks");
     failures += check(content.at(0).at("type") == "thinking" &&
@@ -602,12 +690,24 @@ int test_streaming_events() {
     const Json stop = parse_sse(make_content_block_stop(2), &type);
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
+    failures += check(start.at("message").at("usage").at("cache_read_input_tokens") == 0 &&
+                          start.at("message").at("usage").at("cache_creation_input_tokens") == 0,
+                      "message_start reports no cache activity before admission");
+
+    CompletionUsage final_usage;
+    final_usage.prompt_tokens      = 20;
+    final_usage.completion_tokens  = 5;
+    final_usage.cache_hit_tokens   = 12;
+    final_usage.cache_write_tokens = 6;
+    const Json mdelta = parse_sse(make_message_delta("tool_use", final_usage), &type);
     failures +=
         check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
                   mdelta.at("delta").at("stop_sequence").is_null() &&
-                  mdelta.at("usage").at("output_tokens") == 5,
-              "message_delta stop_reason + usage");
+                  mdelta.at("usage").at("output_tokens") == 5 &&
+                  mdelta.at("usage").at("input_tokens") == 2 &&
+                  mdelta.at("usage").at("cache_read_input_tokens") == 12 &&
+                  mdelta.at("usage").at("cache_creation_input_tokens") == 6,
+              "message_delta stop_reason + cumulative usage split");
 
     const Json mstop = parse_sse(make_message_stop(), &type);
     failures += check(type == "message_stop" && mstop.at("type") == "message_stop", "message_stop");
@@ -655,6 +755,7 @@ int main() {
     failures += test_parse_image();
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
+    failures += test_cache_control_breakpoints();
     failures += test_thinking_and_sampling();
     failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();

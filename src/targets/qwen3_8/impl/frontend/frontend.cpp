@@ -258,7 +258,9 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
         target.parts.reserve(source.parts.size());
         for (MessagePart& part : source.parts) {
             if (part.kind == MessagePartKind::Text) {
-                target.parts.push_back(fi::ChatPart::text_part(std::move(part.text)));
+                fi::ChatPart text = fi::ChatPart::text_part(std::move(part.text));
+                text.cache_breakpoint = part.cache_breakpoint;
+                target.parts.push_back(std::move(text));
                 continue;
             }
             if (part.media.bytes.empty()) {
@@ -268,9 +270,11 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
             media.source_name = std::move(part.media.source_name);
             media.media_type  = std::move(part.media.media_type);
             media.bytes       = std::move(part.media.bytes);
-            target.parts.push_back(part.media.kind == MediaKind::Image
-                                       ? fi::ChatPart::image(std::move(media))
-                                       : fi::ChatPart::video(std::move(media)));
+            fi::ChatPart media_part = part.media.kind == MediaKind::Image
+                                          ? fi::ChatPart::image(std::move(media))
+                                          : fi::ChatPart::video(std::move(media));
+            media_part.cache_breakpoint = part.cache_breakpoint;
+            target.parts.push_back(std::move(media_part));
         }
         result.push_back(std::move(target));
     }
@@ -285,6 +289,7 @@ fi::ChatRenderOptions render_options(const PromptOptions& options,
                                  .preserve_thinking        = options.preserve_thinking,
                                  .prefix_checkpoint_policy = prefix_checkpoint_policy,
                                  .add_vision_id            = options.add_vision_id,
+                                 .prompt_cache_mode        = options.prompt_cache_mode,
                                  .tool_jsons               = options.tool_jsons};
 }
 
@@ -916,27 +921,17 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         result.prepare.vision_tokens          = processed.stats.vision_tokens;
         result.prepare.attention_pairs        = processed.stats.attention_pairs;
         result.prepare.patch_bytes            = processed.stats.patch_bytes;
-        result.identity.stable_prefix_boundary = processed.stable_prefix_boundary;
-        result.identity.turn_rewrite_boundary  = processed.turn_rewrite_boundary;
-        result.identity.user_turn_boundary     = processed.user_turn_boundary;
-        result.identity.checkpoint_hints.reserve(processed.checkpoint_hints.size());
-        for (const fi::ProcessedInput::CheckpointHint& hint : processed.checkpoint_hints) {
-            result.identity.checkpoint_hints.push_back(
-                {static_cast<PromptCheckpointKind>(hint.kind), hint.boundary});
-        }
+        result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
+        result.identity.user_turn_boundary    = processed.user_turn_boundary;
+        result.identity.boundaries            = std::move(processed.boundaries);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, impl_->prefix_checkpoint_policy));
         fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
-        result.token_ids        = std::move(encoded.input_ids);
-        result.identity.stable_prefix_boundary = encoded.stable_prefix_boundary;
+        result.token_ids                      = std::move(encoded.input_ids);
         result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
         result.identity.user_turn_boundary    = encoded.user_turn_boundary;
-        result.identity.checkpoint_hints.reserve(encoded.checkpoint_hints.size());
-        for (const fi::ProcessedInput::CheckpointHint& hint : encoded.checkpoint_hints) {
-            result.identity.checkpoint_hints.push_back(
-                {static_cast<PromptCheckpointKind>(hint.kind), hint.boundary});
-        }
+        result.identity.boundaries            = std::move(encoded.boundaries);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

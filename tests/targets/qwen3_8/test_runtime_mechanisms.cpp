@@ -515,56 +515,100 @@ void test_continuation_prefix_filter_digest() {
 void test_stable_alias_identity() {
     namespace image = q36::detail::continuation;
     q36::PreparedPromptData first = identity_prompt();
-    first.identity.stable_prefix_boundary = 3;
     q36::PreparedPromptData leaf = first;
     leaf.token_ids[3] += 7;
     for (std::size_t axis = 0; axis < 3; ++axis) {
         leaf.positions[axis * leaf.token_ids.size() + 3] += 9;
     }
     const ninfer::cache::Bytes domain{1, 2, 3, 4};
-    const auto key = image::stable_alias(domain, first);
-    expect(key && key == image::stable_alias(domain, leaf),
-           "stable alias ignores user leaf content after the boundary");
+    const auto key = image::boundary_alias(domain, first, 3);
+    expect(key && key == image::boundary_alias(domain, leaf, 3),
+           "boundary alias ignores content after its depth");
 
     const auto differs = [&](auto mutate, std::string_view message) {
         q36::PreparedPromptData changed = first;
         mutate(changed);
-        expect(image::stable_alias(domain, changed) != key, message);
+        expect(image::boundary_alias(domain, changed, 3) != key, message);
     };
-    differs([](auto& prompt) { ++prompt.token_ids[0]; }, "stable alias binds prefix token IDs");
-    differs([](auto& prompt) { ++prompt.token_types[1]; }, "stable alias binds token types");
+    differs([](auto& prompt) { ++prompt.token_ids[0]; }, "boundary alias binds prefix token IDs");
+    differs([](auto& prompt) { ++prompt.token_types[1]; }, "boundary alias binds token types");
     for (std::size_t axis = 0; axis < 3; ++axis) {
         differs([axis](auto& prompt) { ++prompt.positions[axis * prompt.token_ids.size() + 1]; },
-                "stable alias binds every position axis");
+                "boundary alias binds every position axis");
     }
     differs([](auto& prompt) { ++prompt.vision_items[0].content_digest[0]; },
-            "stable alias binds media identity through the boundary");
-    differs([](auto& prompt) { prompt.identity.stable_prefix_boundary = 4; },
-            "stable alias binds the boundary");
-    expect(image::stable_alias(ninfer::cache::Bytes{1, 2, 3, 5}, first) != key,
-           "stable alias binds the Program compatibility domain");
+            "boundary alias binds media identity through the boundary");
+    expect(image::boundary_alias(domain, first, 4) != key, "boundary alias binds the depth");
+    expect(image::boundary_alias(ninfer::cache::Bytes{1, 2, 3, 5}, first, 3) != key,
+           "boundary alias binds the Program compatibility domain");
+    expect(!image::boundary_alias(domain, first, 0) && !image::boundary_alias(domain, first, 5),
+           "boundary alias rejects an empty or overlong prefix");
+    q36::PreparedPromptData unreusable = first;
+    unreusable.identity.reusable       = false;
+    expect(!image::boundary_alias(domain, unreusable, 3),
+           "boundary alias is not derived for a non-reusable prompt");
+
+    // Every boundary names its own alias; only the newest turn openers are looked up.
+    q36::PreparedPromptData windowed = first;
+    for (std::uint32_t depth = 4; depth < 4 + image::kTurnOpenerLookupWindow + 2; ++depth) {
+        append_text_token(windowed, static_cast<ninfer::TokenId>(100 + depth),
+                          static_cast<std::int32_t>(depth));
+    }
+    windowed.identity.boundaries.push_back(
+        {.depth = 1, .kind = q36::PromptBoundaryKind::SystemTools, .publish = true});
+    for (std::uint32_t depth = 3; depth < 3 + image::kTurnOpenerLookupWindow + 2; ++depth) {
+        windowed.identity.boundaries.push_back(
+            {.depth = depth, .kind = q36::PromptBoundaryKind::TurnOpener, .publish = false});
+    }
+    const std::uint32_t deepest = 3 + static_cast<std::uint32_t>(image::kTurnOpenerLookupWindow) + 2;
+    windowed.identity.boundaries.push_back(
+        {.depth = deepest, .kind = q36::PromptBoundaryKind::Explicit, .publish = true});
+    windowed.identity.turn_rewrite_boundary = deepest;
+    const std::vector<q36::PromptBoundaryAlias> aliases = image::boundary_aliases(domain, windowed);
+    expect(aliases.size() == image::kTurnOpenerLookupWindow + 2,
+           "boundary aliases did not window turn openers while keeping other kinds");
+    expect(aliases.front().kind == q36::PromptBoundaryKind::SystemTools &&
+               aliases.front().depth == 1 && aliases.front().publish &&
+               aliases.back().kind == q36::PromptBoundaryKind::Explicit && aliases.back().publish &&
+               aliases[1].kind == q36::PromptBoundaryKind::TurnOpener && aliases[1].depth == 5,
+           "boundary aliases dropped the oldest turn openers rather than the newest");
+    expect(aliases.back().rewrite_frontier &&
+               std::none_of(aliases.begin(), aliases.end() - 1,
+                            [](const auto& alias) { return alias.rewrite_frontier; }),
+           "only the boundary at the turn-rewrite frontier is marked as such");
+    expect(std::is_sorted(aliases.begin(), aliases.end(),
+                          [](const auto& lhs, const auto& rhs) { return lhs.depth < rhs.depth; }) &&
+               aliases.front().alias == *image::boundary_alias(domain, windowed, 1),
+           "boundary aliases are not the per-depth aliases in ascending order");
 }
 
 void test_multiple_checkpoint_planning() {
     namespace image = q36::detail::continuation;
-    expect(image::next_prefill_checkpoint(0, 3, 7, std::nullopt) == 3,
-           "prefill plans the stable checkpoint before a later turn checkpoint");
-    expect(image::next_prefill_checkpoint(3, std::nullopt, 7, std::nullopt) == 7,
-           "prefill plans the later turn checkpoint after stable export");
-    expect(!image::next_prefill_checkpoint(7, std::nullopt, 7, std::nullopt),
+    const std::vector<std::uint32_t> none;
+    const std::vector<std::uint32_t> one{3};
+    const std::vector<std::uint32_t> two{3, 6};
+    expect(image::next_prefill_checkpoint(0, one, 7, std::nullopt) == 3,
+           "prefill plans the capture boundary before a later turn checkpoint");
+    expect(image::next_prefill_checkpoint(3, none, 7, std::nullopt) == 7,
+           "prefill plans the later turn checkpoint after the capture");
+    expect(!image::next_prefill_checkpoint(7, none, 7, std::nullopt),
            "prefill does not recapture a completed checkpoint");
-    expect(image::next_prefill_checkpoint(0, 3, 3, std::nullopt) == 3,
-           "coincident stable and turn boundaries use one device snapshot");
+    expect(image::next_prefill_checkpoint(0, one, 3, std::nullopt) == 3,
+           "coincident capture and turn boundaries use one device snapshot");
+    expect(image::next_prefill_checkpoint(0, two, 7, std::nullopt) == 3 &&
+               image::next_prefill_checkpoint(3, two, 7, std::nullopt) == 6 &&
+               image::next_prefill_checkpoint(6, two, 7, std::nullopt) == 7,
+           "prefill visits every capture boundary in order");
     // The user-turn anchor always sits between the stable prefix and the rewrite frontier, so a
     // cold prefill must land on all three in ascending order.
-    expect(image::next_prefill_checkpoint(0, 3, 7, 5) == 3,
-           "stable prefix precedes the user turn anchor");
-    expect(image::next_prefill_checkpoint(3, std::nullopt, 7, 5) == 5,
+    expect(image::next_prefill_checkpoint(0, one, 7, 5) == 3,
+           "capture boundary precedes the user turn anchor");
+    expect(image::next_prefill_checkpoint(3, none, 7, 5) == 5,
            "user turn anchor precedes the turn checkpoint");
-    expect(image::next_prefill_checkpoint(5, std::nullopt, 7, std::nullopt) == 7,
+    expect(image::next_prefill_checkpoint(5, none, 7, std::nullopt) == 7,
            "turn checkpoint follows a captured user turn anchor");
-    expect(image::next_prefill_checkpoint(0, std::nullopt, 7, 5) == 5,
-           "user turn anchor is planned without a stable prefix");
+    expect(image::next_prefill_checkpoint(0, none, 7, 5) == 5,
+           "user turn anchor is planned without a capture boundary");
 }
 
 } // namespace

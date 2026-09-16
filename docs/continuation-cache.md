@@ -39,7 +39,7 @@ the only implemented policy.
 |---|---|
 | `off` | disables continuation-tier retention; ordinary compatible resident-prefix reuse remains controlled separately by the server's `--no-prefix-reuse` flag |
 | `l1` | retains completed lane state in the existing GPU KV pool, bounded by the L1 byte budget and idle timer |
-| `l1-l2` | adds byte-budgeted complete continuation images in pageable host RAM and session/stable-prefix aliases |
+| `l1-l2` | adds byte-budgeted complete continuation images in pageable host RAM and session/prompt-boundary aliases |
 | `l1-l2-l3` | adds asynchronous, restart-persistent, content-addressed files under `PATH/NAMESPACE` |
 
 Active request state is not a cache tier. It remains protected by normal admission accounting and
@@ -163,11 +163,21 @@ tool schema, media input, reasoning rendering, or runtime profile produces a saf
 local strings, are not authentication boundaries, and must not be used to combine untrusted users
 inside one namespace.
 
-NInfer also derives an immutable alias from an exact stable leading prefix. Requests with identical
-system/developer instructions and tool definitions can share that prefix even when their user
-suffixes differ. Concurrent cold requests use single-flight construction. Each restore currently
-copies state into private GPU storage; reference-counted shared GPU pages and partial-tail COW are
-later optimizations.
+NInfer also derives an immutable, content-addressed alias for each prompt boundary: the end of the
+system/developer/tools prefix, every assistant opener in the history, and every client
+[prompt cache breakpoint](serving.md#prompt-cache-breakpoints). The alias hashes the exact
+tokens, token types, and MRoPE positions through the boundary depth under the runtime
+compatibility key, so any request sharing that prefix derives the same name whatever its suffix
+or `prompt_cache_key`. A request looks up every boundary it carries (the eight newest openers,
+and all system/tools and explicit boundaries), ranks the viable candidates with the routed session
+and the resident lanes by reusable depth, and restores the deepest. It publishes the system/tools
+boundary and every explicit boundary below its turn-rewrite frontier by capturing them during
+prefill, and the boundary at the frontier itself by publishing the completed lane's image - the
+same image a `prompt_cache_key` session head is made of - after the last token. Already-published
+aliases are write-once and skipped. Concurrent cold requests that need the same unpublished
+prefill-captured boundary use single-flight construction: one builds it, the others wait for it.
+Each restore currently copies state into private GPU storage; reference-counted shared GPU pages
+and partial-tail COW are later optimizations.
 
 The artifact compatibility key includes SHA-256 of the complete `.ninfer` file. For the published
 Qwen3.8-27B groupwise artifact used by this repository, that digest is
@@ -265,7 +275,7 @@ path/namespace and session key. Watch the L3 and restore metrics below. Stored R
 not response storage.
 
 The native one-request CLI has no `prompt_cache_key` option. With L3 enabled it can still publish and
-reuse automatically derived stable-prefix aliases across invocations:
+reuse prompt-boundary aliases across invocations, implicit or marked in the messages file:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \

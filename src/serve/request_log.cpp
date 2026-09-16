@@ -271,6 +271,7 @@ Json continuation_json(const GenerationMetrics& metrics) {
                 {"restore_microseconds", value.restore_microseconds},
                 {"restored_tokens", value.restored_tokens},
                 {"restored_bytes", value.restored_bytes},
+                {"cache_write_tokens", value.cache_write_tokens},
                 {"restore_gate_checks", value.restore_gate_checks},
                 {"restore_gate_passes", value.restore_gate_passes},
                 {"restore_target_lane", value.restore_target_lane},
@@ -450,6 +451,7 @@ std::string format_request_done(const RequestLogContext& context,
         << static_cast<double>(metrics.continuation.restore_microseconds) / 1000.0 << "ms"
         << " cache_tokens=" << metrics.continuation.restored_tokens
         << " cache_bytes=" << metrics.continuation.restored_bytes
+        << " cache_write_tokens=" << metrics.continuation.cache_write_tokens
         << " cache_rollback=" << (metrics.continuation.destructive_rollback ? "yes" : "no")
         << " cache_publish_queued="
         << (metrics.continuation.completion_publication_queued ? "yes" : "no");

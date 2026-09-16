@@ -1,5 +1,6 @@
 #include "serve/anthropic_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -134,15 +135,51 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     return out;
 }
 
+// Per-request count of `cache_control` breakpoints, across system, tools and messages.
+struct BreakpointBudget {
+    std::size_t used = 0;
+};
+
+// A block-level `cache_control` marks the end of the block as a content-addressed prompt-cache
+// boundary. Only the ephemeral kind exists, and its lifetime is the server's continuation-cache
+// idle timers, so `ttl` is refused rather than silently ignored. Returns whether the block
+// carries a breakpoint.
+bool parse_cache_control(const Json& block, const char* param, BreakpointBudget& budget) {
+    if (!block.is_object() || !block.contains("cache_control") ||
+        block.at("cache_control").is_null()) {
+        return false;
+    }
+    const Json& control = block.at("cache_control");
+    if (!control.is_object() || !control.contains("type") || !control.at("type").is_string() ||
+        control.at("type").get<std::string>() != "ephemeral") {
+        bad_request("cache_control must be {\"type\": \"ephemeral\"}", param, "invalid_value");
+    }
+    for (auto it = control.begin(); it != control.end(); ++it) {
+        if (it.key() != "type" && !it.value().is_null()) {
+            bad_request("cache_control." + it.key() + " is not supported", param,
+                        "parameter_not_supported");
+        }
+    }
+    if (++budget.used > kMaxPromptCacheBreakpoints) {
+        bad_request("at most " + std::to_string(kMaxPromptCacheBreakpoints) +
+                        " cache_control breakpoints are allowed per request",
+                    param, "too_many_cache_control_breakpoints");
+    }
+    return true;
+}
+
 // --- request parsing --------------------------------------------------------
 
-void parse_tools(const Json& body, GenerationRequest& out) {
+void parse_tools(const Json& body, GenerationRequest& out, BreakpointBudget& budget) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     const Json& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
     out.tools.reserve(tools.size());
     for (const Json& item : tools) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
+        // The tools block ends the rendered system prefix, which is already an implicit
+        // boundary: a breakpoint here is accepted and changes nothing.
+        (void)parse_cache_control(item, "tools", budget);
         // Anthropic server/built-in tools carry a `type` and no `input_schema`; we
         // only support client tools (name + input_schema), which is what Claude
         // Code sends for its own tools.
@@ -205,7 +242,7 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
 // Flatten a system value (string or array of text blocks) into plain text. Used
 // for both the top-level `system` field and any system-role turn Claude Code
 // injects into the messages array.
-std::string flatten_system_value(const Json& value, const char* param) {
+std::string flatten_system_value(const Json& value, const char* param, BreakpointBudget& budget) {
     std::string text;
     if (value.is_string()) {
         text = value.get<std::string>();
@@ -214,6 +251,9 @@ std::string flatten_system_value(const Json& value, const char* param) {
             if (require_block_type(block, param) != "text") {
                 bad_request("only text system blocks are supported", param);
             }
+            // The system block ends at the implicit system/tools boundary; a breakpoint here is
+            // accepted and changes nothing.
+            (void)parse_cache_control(block, param, budget);
             append_text(text, require_string_field(block, "text", "system text block"));
         }
     } else {
@@ -222,9 +262,9 @@ std::string flatten_system_value(const Json& value, const char* param) {
     return text;
 }
 
-void parse_system(const Json& body, std::string& system_text) {
+void parse_system(const Json& body, std::string& system_text, BreakpointBudget& budget) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
-    append_text(system_text, flatten_system_value(body.at("system"), "system"));
+    append_text(system_text, flatten_system_value(body.at("system"), "system", budget));
 }
 
 ToolCall parse_tool_use(const Json& block) {
@@ -242,16 +282,13 @@ ToolCall parse_tool_use(const Json& block) {
     return call;
 }
 
-std::vector<ContentPart> parse_tool_result_content(const Json& block) {
+std::vector<ContentPart> parse_tool_result_content(const Json& block, BreakpointBudget& budget) {
+    std::vector<ContentPart> parts;
     if (!block.contains("content") || block.at("content").is_null()) {
-        return {ContentPart{ContentKind::Text, {}, "text"}};
-    }
-    const Json& content = block.at("content");
-    if (content.is_string()) {
-        return {ContentPart{ContentKind::Text, content.get<std::string>(), "text"}};
-    }
-    if (content.is_array()) {
-        std::vector<ContentPart> parts;
+        parts.push_back(ContentPart{ContentKind::Text, {}, "text"});
+    } else if (const Json& content = block.at("content"); content.is_string()) {
+        parts.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
+    } else if (content.is_array()) {
         for (const Json& part : content) {
             const std::string type = require_block_type(part, "messages");
             if (type == "text") {
@@ -266,17 +303,24 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
             } else {
                 bad_request("unsupported tool_result content block: " + type, "messages");
             }
+            parts.back().cache_breakpoint = parse_cache_control(part, "messages", budget);
         }
-        return parts;
+        if (parts.empty()) { parts.push_back(ContentPart{ContentKind::Text, {}, "text"}); }
+    } else {
+        bad_request("tool_result content must be a string or array of blocks", "messages");
     }
-    bad_request("tool_result content must be a string or array of blocks", "messages");
-    return {};
+    // A breakpoint on the tool_result block itself covers the whole result, so it lands after
+    // the rendered tool response.
+    if (parse_cache_control(block, "messages", budget)) { parts.back().cache_breakpoint = true; }
+    return parts;
 }
 
-void parse_assistant_content(const Json& content, GenerationRequest& out) {
+void parse_assistant_content(const Json& content, GenerationRequest& out,
+                             BreakpointBudget& budget) {
     ChatTurn turn;
     turn.role = "assistant";
     std::string text;
+    bool cache_breakpoint = false;
     for (const Json& block : content) {
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
@@ -292,9 +336,14 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
         } else {
             bad_request("unsupported assistant content block: " + type, "messages");
         }
+        // The assistant turn renders as one unit, so any block's breakpoint lands after the
+        // whole turn.
+        cache_breakpoint = parse_cache_control(block, "messages", budget) || cache_breakpoint;
     }
-    if (!text.empty()) {
-        turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+    if (!text.empty() || cache_breakpoint) {
+        ContentPart part{ContentKind::Text, std::move(text), "text"};
+        part.cache_breakpoint = cache_breakpoint;
+        turn.content.push_back(std::move(part));
     }
     if (turn.content.empty() && turn.tool_calls.empty() && turn.reasoning_content.empty()) {
         bad_request("assistant message must have text, thinking, or tool_use content", "messages");
@@ -302,7 +351,7 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
     out.messages.push_back(std::move(turn));
 }
 
-void parse_user_content(const Json& content, GenerationRequest& out) {
+void parse_user_content(const Json& content, GenerationRequest& out, BreakpointBudget& budget) {
     // A user turn may carry tool_result blocks (each -> its own tool turn) and/or
     // text blocks (folded into one user turn emitted after the tool turns, matching
     // the Qwen template's assistant-tool_calls -> tool-responses -> user order).
@@ -312,7 +361,9 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
             std::string text = require_string_field(block, "text", "text block");
-            user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+            ContentPart part{ContentKind::Text, std::move(text), "text"};
+            part.cache_breakpoint = parse_cache_control(block, "messages", budget);
+            user_turn.content.push_back(std::move(part));
         } else if (type == "tool_result") {
             if (!block.contains("tool_use_id") || !block.at("tool_use_id").is_string() ||
                 block.at("tool_use_id").get<std::string>().empty()) {
@@ -321,13 +372,14 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
             ChatTurn tool_turn;
             tool_turn.role         = "tool";
             tool_turn.tool_call_id = block.at("tool_use_id").get<std::string>();
-            tool_turn.content      = parse_tool_result_content(block);
+            tool_turn.content      = parse_tool_result_content(block, budget);
             out.messages.push_back(std::move(tool_turn));
         } else if (type == "image") {
             ContentPart part;
-            part.kind     = ContentKind::Image;
-            part.type_raw = "image";
-            part.source   = parse_image_source(block);
+            part.kind             = ContentKind::Image;
+            part.type_raw         = "image";
+            part.source           = parse_image_source(block);
+            part.cache_breakpoint = parse_cache_control(block, "messages", budget);
             user_turn.content.push_back(std::move(part));
         } else {
             bad_request("unsupported user content block: " + type, "messages");
@@ -336,7 +388,8 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
     if (!user_turn.content.empty()) { out.messages.push_back(std::move(user_turn)); }
 }
 
-void parse_messages(const Json& body, GenerationRequest& out, std::string& system_text) {
+void parse_messages(const Json& body, GenerationRequest& out, std::string& system_text,
+                    BreakpointBudget& budget) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -363,7 +416,7 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
             // Claude Code injects system reminders as system-role messages inside
             // the messages array. Fold them into the leading system block: the Qwen
             // chat template only honors leading system turns and drops the rest.
-            append_text(system_text, flatten_system_value(content, "messages"));
+            append_text(system_text, flatten_system_value(content, "messages", budget));
             continue;
         }
         if (content.is_string()) {
@@ -374,9 +427,9 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
             out.messages.push_back(std::move(turn));
         } else if (content.is_array()) {
             if (role == "assistant") {
-                parse_assistant_content(content, out);
+                parse_assistant_content(content, out, budget);
             } else {
-                parse_user_content(content, out);
+                parse_user_content(content, out, budget);
             }
         } else {
             bad_request("message " + std::to_string(i) + " content must be a string or array",
@@ -482,11 +535,12 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     }
     out.model = body.at("model").get<std::string>();
 
-    parse_tools(body, out);
+    BreakpointBudget budget;
+    parse_tools(body, out, budget);
     parse_tool_choice(body, out);
     std::string system_text;
-    parse_system(body, system_text);
-    parse_messages(body, out, system_text);
+    parse_system(body, system_text, budget);
+    parse_messages(body, out, system_text, budget);
     // The leading system turn combines the top-level `system` field with any
     // system-role reminders folded out of the messages array.
     if (!system_text.empty()) {
@@ -536,6 +590,19 @@ const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_call
     return "end_turn";
 }
 
+// Anthropic usage splits the prompt into uncached `input_tokens`, tokens restored from the
+// prompt cache, and tokens this request captured for later reuse; the three sum to the prompt.
+Json messages_usage(const CompletionUsage& usage) {
+    const std::int64_t prompt = std::max<std::int64_t>(0, usage.prompt_tokens);
+    const std::int64_t read   = std::clamp<std::int64_t>(usage.cache_hit_tokens, 0, prompt);
+    const std::int64_t written =
+        std::clamp<std::int64_t>(usage.cache_write_tokens, 0, prompt - read);
+    return Json{{"input_tokens", prompt - read - written},
+                {"cache_creation_input_tokens", written},
+                {"cache_read_input_tokens", read},
+                {"output_tokens", usage.completion_tokens}};
+}
+
 std::string make_messages_response(const std::string& id, const std::string& model,
                                    const std::string& content, const std::string& reasoning,
                                    const std::vector<ToolCall>& tool_calls, const char* stop_reason,
@@ -561,8 +628,7 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                           {"content", std::move(blocks)},
                           {"stop_reason", stop_reason},
                           {"stop_sequence", nullptr},
-                          {"usage", Json{{"input_tokens", usage.prompt_tokens},
-                                         {"output_tokens", usage.completion_tokens}}}};
+                          {"usage", messages_usage(usage)}};
     return payload.dump();
 }
 
@@ -574,7 +640,10 @@ std::string make_message_start(const std::string& id, const std::string& model, 
                           {"content", Json::array()},
                           {"stop_reason", nullptr},
                           {"stop_sequence", nullptr},
-                          {"usage", Json{{"input_tokens", input_tokens}, {"output_tokens", 0}}}};
+                          {"usage", Json{{"input_tokens", input_tokens},
+                                         {"cache_creation_input_tokens", 0},
+                                         {"cache_read_input_tokens", 0},
+                                         {"output_tokens", 0}}}};
     return sse("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 
@@ -626,11 +695,11 @@ std::string make_content_block_stop(int index) {
     return sse("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}});
 }
 
-std::string make_message_delta(const char* stop_reason, int output_tokens) {
+std::string make_message_delta(const char* stop_reason, const CompletionUsage& usage) {
     return sse("message_delta",
                Json{{"type", "message_delta"},
                     {"delta", Json{{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-                    {"usage", Json{{"output_tokens", output_tokens}}}});
+                    {"usage", messages_usage(usage)}});
 }
 
 std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }

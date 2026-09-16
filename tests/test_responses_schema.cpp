@@ -364,12 +364,6 @@ int test_explicit_rejections() {
                               "unknown_parameter",
                           message);
     };
-    rejects_nested(Json{{"type", "message"},
-                        {"role", "user"},
-                        {"content", Json::array({Json{{"type", "input_text"},
-                                                      {"text", "hello"},
-                                                      {"prompt_cache_breakpoint", true}}})}},
-                   "nested prompt_cache_breakpoint was dropped");
     rejects_nested(
         Json{{"type", "message"},
              {"role", "user"},
@@ -410,6 +404,97 @@ int test_explicit_rejections() {
     return failures;
 }
 
+int test_prompt_cache_breakpoints() {
+    const Json marker = Json{{"mode", "explicit"}};
+    const auto text   = [&](const char* type, const char* value, bool marked) {
+        Json part = Json{{"type", type}, {"text", value}};
+        if (marked) { part["prompt_cache_breakpoint"] = marker; }
+        return part;
+    };
+    Json body = {{"model", "qwen3.8-27b"},
+                 {"max_output_tokens", 32},
+                 {"prompt_cache_options", marker},
+                 {"input",
+                  Json::array(
+                      {Json{{"type", "message"},
+                            {"role", "developer"},
+                            {"content", Json::array({text("input_text", "rules", true)})}},
+                       Json{{"type", "message"},
+                            {"role", "user"},
+                            {"content", Json::array({text("input_text", "first", true),
+                                                     text("input_text", "second", false)})}},
+                       Json{{"type", "message"},
+                            {"role", "assistant"},
+                            {"content", Json::array({text("output_text", "reply", true)})}},
+                       Json{{"type", "function_call"},
+                            {"call_id", "call_1"},
+                            {"name", "weather"},
+                            {"arguments", "{}"}},
+                       Json{{"type", "function_call_output"},
+                            {"call_id", "call_1"},
+                            {"output", Json::array({text("input_text", "sunny", true)})}}})}};
+    int failures = 0;
+    const ResponsesRequest request = parse_responses_request(body, limits());
+    failures += check(request.generation.prompt_cache_mode == ninfer::PromptCacheMode::Explicit,
+                      "prompt_cache_options.mode explicit not carried");
+    // developer, user, assistant text, assistant call, tool
+    failures += check(request.input_turns.size() == 5 &&
+                          request.input_turns[0].content[0].cache_breakpoint &&
+                          request.input_turns[1].content[0].cache_breakpoint &&
+                          !request.input_turns[1].content[1].cache_breakpoint &&
+                          request.input_turns[2].content[0].cache_breakpoint &&
+                          request.input_turns[4].content[0].cache_breakpoint,
+                      "prompt_cache_breakpoint markers not carried onto their parts");
+    failures += check(request.input_items[1].at("content")[0].at("prompt_cache_breakpoint") ==
+                              marker &&
+                          !request.input_items[1].at("content")[1].contains(
+                              "prompt_cache_breakpoint") &&
+                          request.input_items[4].at("output")[0].at("prompt_cache_breakpoint") ==
+                              marker,
+                      "canonical input Items did not round-trip the markers");
+    const ninfer::PromptInput prompt = to_prompt_input(
+        request.generation, resolve_prompt_semantics(request.generation, ServeOptions{},
+                                                     effort_capabilities()),
+        nullptr);
+    failures += check(prompt.options.prompt_cache_mode == ninfer::PromptCacheMode::Explicit &&
+                          prompt.messages[1].parts.front().cache_breakpoint &&
+                          !prompt.messages[1].parts.back().cache_breakpoint,
+                      "breakpoints did not reach the prompt input");
+
+    Json fifth = body;
+    fifth["input"][1]["content"][1]["prompt_cache_breakpoint"] = marker;
+    failures += check(api_code([&] { (void)parse_responses_request(fifth, limits()); }) ==
+                          "too_many_prompt_cache_breakpoints",
+                      "fifth prompt_cache_breakpoint accepted");
+
+    Json implicit                    = body;
+    implicit["prompt_cache_options"] = Json{{"mode", "implicit"}};
+    failures += check(parse_responses_request(implicit, limits()).generation.prompt_cache_mode ==
+                          ninfer::PromptCacheMode::Implicit,
+                      "prompt_cache_options.mode implicit not carried");
+    Json unknown_mode                    = body;
+    unknown_mode["prompt_cache_options"] = Json{{"mode", "sticky"}};
+    failures += check(api_code([&] { (void)parse_responses_request(unknown_mode, limits()); }) ==
+                          "invalid_value",
+                      "unknown prompt_cache_options.mode accepted");
+    Json retention                    = body;
+    retention["prompt_cache_options"] = Json{{"mode", "explicit"}, {"retention", "24h"}};
+    failures += check(api_code([&] { (void)parse_responses_request(retention, limits()); }) ==
+                          "parameter_not_supported",
+                      "prompt_cache_options.retention accepted");
+    Json implicit_marker = body;
+    implicit_marker["input"][1]["content"][0]["prompt_cache_breakpoint"] =
+        Json{{"mode", "implicit"}};
+    failures += check(api_code([&] { (void)parse_responses_request(implicit_marker, limits()); }) ==
+                          "invalid_value",
+                      "implicit block marker accepted");
+    Json bare_marker = body;
+    bare_marker["input"][1]["content"][0]["prompt_cache_breakpoint"] = true;
+    failures += check(throws_api([&] { (void)parse_responses_request(bare_marker, limits()); }),
+                      "non-object block marker accepted");
+    return failures;
+}
+
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
     outcome.text                            = "answer";
@@ -419,6 +504,8 @@ GenerationOutcome sample_outcome() {
     outcome.reasoning_tokens                = 3;
     outcome.finish_reason                   = ninfer::FinishReason::StopToken;
     outcome.metrics.prefix_cache_hit_tokens = 4;
+    // Deeper than the prompt leaves room for: clamped to prompt - cached in usage.
+    outcome.metrics.continuation.cache_write_tokens = 9;
     return outcome;
 }
 
@@ -457,7 +544,7 @@ int test_response_object() {
                       "Responses object did not echo summary and cache key");
     failures +=
         check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
-                  response.at("usage").at("input_tokens_details").at("cache_write_tokens") == 0 &&
+                  response.at("usage").at("input_tokens_details").at("cache_write_tokens") == 7 &&
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
                   response.at("usage").at("total_tokens") == 18,
               "Responses usage details serialized");
@@ -706,6 +793,7 @@ int main() {
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
+    failures += test_prompt_cache_breakpoints();
     failures += test_response_object();
     failures += test_public_reasoning_and_include_hint();
     failures += test_default_reasoning_stream();

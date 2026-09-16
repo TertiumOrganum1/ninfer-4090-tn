@@ -31,12 +31,9 @@ void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::siz
         }
         if (end <= boundary) { boundary = boundary - needle_size + replacement_size; }
     };
-    if (rendered.stable_prefix_byte_offset) { adjust(*rendered.stable_prefix_byte_offset); }
     if (rendered.turn_rewrite_byte_offset) { adjust(*rendered.turn_rewrite_byte_offset); }
     if (rendered.user_turn_byte_offset) { adjust(*rendered.user_turn_byte_offset); }
-    for (SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
-        adjust(hint.byte_offset);
-    }
+    for (PromptBoundaryByteHint& hint : rendered.boundaries) { adjust(hint.byte_offset); }
 }
 
 namespace {
@@ -560,10 +557,25 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         }
         return static_cast<std::uint32_t>(prefix.size());
     };
-    if (rendered.stable_prefix_byte_offset) {
-        encoded.stable_prefix_boundary =
-            encode_boundary(*rendered.stable_prefix_byte_offset, true, "stable prefix");
-    }
+    // A client byte cut has no token-alignment guarantee. The longest common prefix of its own
+    // encoding with the complete encoding is the deepest exact token prefix at or before the
+    // cut, which is what the boundary snaps back to.
+    const auto snap_boundary = [&](std::size_t byte_offset) -> std::uint32_t {
+        if (byte_offset > rendered.text.size()) {
+            throw std::logic_error("explicit boundary byte offset exceeds rendered chat");
+        }
+        std::vector<int> prefix;
+        try {
+            prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, byte_offset));
+        } catch (const std::exception&) { return 0; }
+        const auto divergence = std::mismatch(prefix.begin(), prefix.end(),
+                                              encoded.input_ids.begin(), encoded.input_ids.end());
+        const std::size_t common = static_cast<std::size_t>(divergence.first - prefix.begin());
+        if (common > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("explicit token boundary exceeds uint32");
+        }
+        return static_cast<std::uint32_t>(common);
+    };
     if (rendered.turn_rewrite_byte_offset) {
         encoded.turn_rewrite_boundary =
             encode_boundary(*rendered.turn_rewrite_byte_offset, false, "turn rewrite prefix");
@@ -572,18 +584,30 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         encoded.user_turn_boundary =
             encode_boundary(*rendered.user_turn_byte_offset, false, "user turn prefix");
     }
-    encoded.checkpoint_hints.reserve(rendered.checkpoint_hints.size());
-    std::optional<std::uint32_t> previous;
-    for (const SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
-        // Do not derive one boundary from another: every semantic byte cut must independently
+    encoded.boundaries.reserve(rendered.boundaries.size());
+    for (const PromptBoundaryByteHint& hint : rendered.boundaries) {
+        // Do not derive one boundary from another: every template byte cut must independently
         // satisfy tokenizer prefix stability.
-        const std::uint32_t boundary =
-            encode_boundary(hint.byte_offset, true, "semantic checkpoint prefix");
-        if (previous && boundary < *previous) {
-            throw std::logic_error("semantic checkpoint boundaries are not ordered");
+        const bool explicit_cut    = hint.kind == PromptBoundaryKind::Explicit;
+        const std::uint32_t depth = explicit_cut
+                                        ? snap_boundary(hint.byte_offset)
+                                        : encode_boundary(hint.byte_offset, true, "prompt boundary");
+        if (depth == 0) { continue; }
+        if (!encoded.boundaries.empty()) {
+            PromptBoundary& last = encoded.boundaries.back();
+            if (depth < last.depth) {
+                if (explicit_cut) { continue; }
+                throw std::logic_error("prompt boundaries are not ordered");
+            }
+            if (depth == last.depth) {
+                last.publish = last.publish || hint.publish;
+                if (last.kind == PromptBoundaryKind::TurnOpener && explicit_cut) {
+                    last.kind = PromptBoundaryKind::Explicit;
+                }
+                continue;
+            }
         }
-        encoded.checkpoint_hints.push_back({hint.kind, boundary});
-        previous = boundary;
+        encoded.boundaries.push_back({.depth = depth, .kind = hint.kind, .publish = hint.publish});
     }
     return encoded;
 }
@@ -654,10 +678,9 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     rendered                     = expand_placeholders(std::move(rendered), items);
     EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
     output.input_ids             = std::move(encoded.input_ids);
-    output.stable_prefix_boundary = encoded.stable_prefix_boundary;
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
     output.user_turn_boundary    = encoded.user_turn_boundary;
-    output.checkpoint_hints = std::move(encoded.checkpoint_hints);
+    output.boundaries            = std::move(encoded.boundaries);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

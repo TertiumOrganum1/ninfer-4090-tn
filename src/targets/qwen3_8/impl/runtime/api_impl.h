@@ -141,10 +141,11 @@ Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
 }
 
 template <>
-RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
-                                                             const RequestBasePlan<Variant>& base) {
-    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base);
+RequestPlan<Variant> Program<Variant>::plan_request_for_lane(
+    std::uint32_t lane, const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
+    std::span<const std::uint32_t> capture_depths) {
+    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base,
+                                        capture_depths);
 }
 
 template <>
@@ -251,15 +252,15 @@ cache::ContinuationImage Program<Variant>::export_continuation_lane(std::uint32_
 }
 
 template <>
-std::optional<std::string>
-Program<Variant>::stable_prefix_alias(const PreparedPrompt& prompt) const {
-    return impl_->stable_prefix_alias(PreparedPromptAccess::view(prompt));
+std::vector<PromptBoundaryAlias>
+Program<Variant>::boundary_aliases(const PreparedPrompt& prompt) const {
+    return impl_->boundary_aliases(PreparedPromptAccess::view(prompt));
 }
 
 template <>
-std::optional<cache::ContinuationImage>
-Program<Variant>::take_stable_continuation_lane(std::uint32_t lane) {
-    return impl_->take_stable_continuation_lane(lane);
+std::vector<CapturedContinuation>
+Program<Variant>::take_captured_continuations_lane(std::uint32_t lane) {
+    return impl_->take_captured_continuations_lane(lane);
 }
 
 template <>

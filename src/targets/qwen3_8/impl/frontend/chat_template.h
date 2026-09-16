@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ninfer/targets/qwen3_8/prepared_prompt.h>
 #include <ninfer/types.h>
 
 #include <cstddef>
@@ -33,6 +34,8 @@ struct ChatPart {
     ChatPartKind kind = ChatPartKind::Text;
     std::string text;
     MediaData media;
+    // Client-selected prompt-cache breakpoint at the end of this part.
+    bool cache_breakpoint = false;
 
     static ChatPart text_part(std::string value) {
         ChatPart part;
@@ -63,9 +66,12 @@ struct ChatMessage {
     std::string tool_call_id;
 
     [[nodiscard]] bool has_media() const noexcept;
+    // part_ends, when given, receives the byte offset in the returned string at which each part
+    // ends, in part order.
     [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
                                                int* image_count   = nullptr,
-                                               int* video_count   = nullptr) const;
+                                               int* video_count   = nullptr,
+                                               std::vector<std::size_t>* part_ends = nullptr) const;
 };
 
 struct ChatRenderOptions {
@@ -75,30 +81,27 @@ struct ChatRenderOptions {
     std::optional<bool> preserve_thinking;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     bool add_vision_id                              = false;
+    PromptCacheMode prompt_cache_mode               = PromptCacheMode::Implicit;
     std::vector<std::string> tool_jsons;
 };
 
-enum class SemanticCheckpointKind : std::uint8_t {
-    StablePrefix,
-    StableTurn,
-    Rolling,
-};
-
-struct SemanticCheckpointByteHint {
-    SemanticCheckpointKind kind = SemanticCheckpointKind::StablePrefix;
-    std::size_t byte_offset     = 0;
+struct PromptBoundaryByteHint {
+    PromptBoundaryKind kind = PromptBoundaryKind::SystemTools;
+    std::size_t byte_offset = 0;
+    bool publish            = false;
 };
 
 struct RenderedChat {
     std::string text;
-    std::optional<std::size_t> stable_prefix_byte_offset;
     std::optional<std::size_t> turn_rewrite_byte_offset;
     // Opener of the last real user query. Unlike the turn-rewrite frontier this sits *before*
     // that message's content, so it survives a client rewriting the message's tail - the
     // floating-reminder pattern that otherwise invalidates every deeper anchor.
     std::optional<std::size_t> user_turn_byte_offset;
-    // These offsets mark model-state-safe semantic frontiers, not arbitrary message ends.
-    std::vector<SemanticCheckpointByteHint> checkpoint_hints;
+    // Strictly ascending by byte offset, none past `turn_rewrite_byte_offset`. Template-derived
+    // kinds sit on exact token frontiers; Explicit ones sit where the client put them and are
+    // snapped to a token boundary when encoded.
+    std::vector<PromptBoundaryByteHint> boundaries;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

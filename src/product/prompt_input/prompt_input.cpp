@@ -84,6 +84,35 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
     return result;
 }
 
+// A text part's `prompt_cache_breakpoint` uses the Responses wire shape, `{"mode": "explicit"}`.
+bool parse_cache_breakpoint(const Json& part, std::size_t message_index) {
+    if (!part.contains("prompt_cache_breakpoint") || part.at("prompt_cache_breakpoint").is_null()) {
+        return false;
+    }
+    const Json& breakpoint = part.at("prompt_cache_breakpoint");
+    if (!breakpoint.is_object() || breakpoint.size() != 1 || !breakpoint.contains("mode") ||
+        !breakpoint.at("mode").is_string() || breakpoint.at("mode").get<std::string>() != "explicit") {
+        throw std::invalid_argument("message " + std::to_string(message_index) +
+                                    " prompt_cache_breakpoint must be {\"mode\": \"explicit\"}");
+    }
+    return true;
+}
+
+PromptCacheMode parse_prompt_cache_mode(const Json& root) {
+    if (!root.contains("prompt_cache_options") || root.at("prompt_cache_options").is_null()) {
+        return PromptCacheMode::Implicit;
+    }
+    const Json& options = root.at("prompt_cache_options");
+    if (!options.is_object() || options.size() != 1 || !options.contains("mode") ||
+        !options.at("mode").is_string()) {
+        throw std::invalid_argument("prompt_cache_options must be {\"mode\": \"implicit\"|\"explicit\"}");
+    }
+    const std::string mode = options.at("mode").get<std::string>();
+    if (mode == "implicit") { return PromptCacheMode::Implicit; }
+    if (mode == "explicit") { return PromptCacheMode::Explicit; }
+    throw std::invalid_argument("prompt_cache_options.mode must be \"implicit\" or \"explicit\"");
+}
+
 std::vector<MessagePart> parse_content(const Json& content, std::size_t message_index,
                                        bool vision_enabled) {
     if (content.is_null()) { return {}; }
@@ -111,7 +140,8 @@ std::vector<MessagePart> parse_content(const Json& content, std::size_t message_
             if (!item.contains("text") || !item.at("text").is_string()) {
                 throw std::invalid_argument("text content part must contain string text");
             }
-            part.text = item.at("text").get<std::string>();
+            part.text             = item.at("text").get<std::string>();
+            part.cache_breakpoint = parse_cache_breakpoint(item, message_index);
         } else if (type == "image" || type == "image_url" || item.contains("image") ||
                    item.contains("image_url")) {
             if (!vision_enabled) {
@@ -257,6 +287,7 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
                 input.options.tool_jsons.push_back(tool.dump());
             }
         }
+        input.options.prompt_cache_mode = parse_prompt_cache_mode(root);
         if (!root.contains("messages")) {
             throw std::invalid_argument("messages JSON object must contain messages");
         }
