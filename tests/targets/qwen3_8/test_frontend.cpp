@@ -1102,6 +1102,31 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+// A tripped repetition guard licenses the round against its own extent with RepetitionCycle, the
+// executor route that first retired a live engine when the decoder rejected that reason.
+int test_repetition_cycle_limit(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    const std::array<ninfer::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview(tokens, 2, ninfer::FinishReason::RepetitionCycle);
+    int failures        = check(decision.accepted_tokens == 2 && decision.finished() &&
+                                    decision.finish_reason == ninfer::FinishReason::RepetitionCycle,
+                                "repetition-cycle round did not terminalize at its own extent");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "repetition-cycle terminal did not flush the decoder channels");
+    return failures;
+}
+
 ninfer::PromptInput thinking_prompt_input() {
     ninfer::ChatMessage message;
     message.role = "user";
@@ -1249,6 +1274,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_repetition_cycle_limit(frontend);
     failures += test_unclosed_thinking_tool_call_becomes_content(frontend);
     failures += test_closed_thinking_keeps_tool_call_as_reasoning(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

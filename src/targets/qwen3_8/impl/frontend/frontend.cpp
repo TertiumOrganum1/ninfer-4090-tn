@@ -750,8 +750,11 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     if (tokens.size() > budget_remaining) {
         throw std::invalid_argument("generated-token round exceeds the remaining budget");
     }
+    // The round is licensed against a budget the caller chose: the remaining output or context
+    // budget, or the round's own extent when a tripped repetition guard ends the request here.
     if (limit_reason != FinishReason::OutputLimit &&
-        limit_reason != FinishReason::ContextCapacity) {
+        limit_reason != FinishReason::ContextCapacity &&
+        limit_reason != FinishReason::RepetitionCycle) {
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
