@@ -311,7 +311,9 @@ inline std::optional<std::string> stable_alias(
     hash.update(std::as_bytes(std::span(bytes)));
     const artifact::Sha256Digest digest = hash.finish();
     constexpr char hex[] = "0123456789abcdef";
-    std::string alias(cache::kStableAliasPrefix);
+    // The cache treats an alias name as opaque and carries what it means in AliasKind, so this
+    // namespace exists only to keep the target's own alias space distinct from a routing hint.
+    std::string alias("@stable/v1/");
     alias.reserve(alias.size() + 64);
     for (const std::uint8_t byte : digest) {
         alias.push_back(hex[byte >> 4]);

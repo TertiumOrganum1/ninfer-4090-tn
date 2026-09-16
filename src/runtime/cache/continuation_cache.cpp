@@ -36,7 +36,7 @@ using Clock = std::chrono::system_clock;
 constexpr std::array<char, 8> kImageMagic{'N', 'I', 'C', 'I', 'M', 'G', '0', '3'};
 constexpr std::array<char, 8> kManifestMagic{'N', 'I', 'C', 'M', 'A', 'N', '0', '5'};
 constexpr std::array<char, 8> kAliasMagic{'N', 'I', 'C', 'A', 'L', 'I', 'A', 'S'};
-constexpr std::uint32_t kAliasVersion      = 1;
+constexpr std::uint32_t kAliasVersion      = 2;
 constexpr std::size_t kMaxAliasBytes       = 1U << 20;
 constexpr std::size_t kMaxSessionNameBytes = 64U << 10;
 constexpr std::size_t kMaxField                    = 1ULL << 34;
@@ -543,18 +543,36 @@ Manifest decode_manifest(const Bytes& bytes, std::size_t image_limit, std::size_
     return m;
 }
 
-struct Alias {
-    std::string session;
+// An alias is a name plus the kind that decides what the name means. The kind is stored, never
+// inferred from the name, so a caller is free to namespace the name however it needs to.
+struct AliasEntry {
+    AliasKind kind = AliasKind::Session;
     std::vector<ContentId> history;
 };
 
-Bytes encode_alias(std::string_view session, const std::vector<ContentId>& history) {
+struct Alias {
+    std::string session;
+    AliasEntry entry;
+};
+
+std::optional<AliasKind> decode_alias_kind(std::uint32_t value) {
+    switch (value) {
+    case 0: return AliasKind::Session;
+    case 1: return AliasKind::StablePrefix;
+    default: return std::nullopt;
+    }
+}
+
+Bytes encode_alias(std::string_view session, const AliasEntry& entry) {
     if (session.size() > kMaxSessionNameBytes) throw std::invalid_argument("session name too long");
+    if (entry.kind == AliasKind::StablePrefix && entry.history.size() != 1)
+        throw std::invalid_argument("stable-prefix alias must hold exactly one image");
     Bytes out(kAliasMagic.begin(), kAliasMagic.end());
     put_u32(out, kAliasVersion);
+    put_u32(out, entry.kind == AliasKind::StablePrefix ? 1U : 0U);
     put_string(out, session);
-    put_u64(out, history.size());
-    for (const auto& id : history) {
+    put_u64(out, entry.history.size());
+    for (const auto& id : entry.history) {
         if (!id.valid()) throw std::invalid_argument("invalid alias content ID");
         put_string(out, id.hex);
     }
@@ -567,16 +585,19 @@ Alias decode_alias(const Bytes& bytes, std::size_t history_depth) {
     Reader r(bytes);
     r.magic(kAliasMagic);
     if (r.u32() != kAliasVersion) throw std::runtime_error("unsupported alias version");
-    Alias alias{r.string(), {}};
+    const auto kind = decode_alias_kind(r.u32());
+    if (!kind) throw std::runtime_error("unsupported alias kind");
+    Alias alias{r.string(), AliasEntry{*kind, {}}};
     if (alias.session.size() > kMaxSessionNameBytes)
         throw std::runtime_error("session name too long");
     const auto count = r.u64();
-    if (count == 0 || count > history_depth) throw std::runtime_error("invalid alias history size");
-    alias.history.reserve(static_cast<std::size_t>(count));
+    const std::uint64_t limit = *kind == AliasKind::StablePrefix ? 1U : history_depth;
+    if (count == 0 || count > limit) throw std::runtime_error("invalid alias history size");
+    alias.entry.history.reserve(static_cast<std::size_t>(count));
     for (std::uint64_t i = 0; i != count; ++i) {
         ContentId id{r.string()};
         if (!id.valid()) throw std::runtime_error("invalid alias content ID");
-        alias.history.push_back(std::move(id));
+        alias.entry.history.push_back(std::move(id));
     }
     r.done();
     return alias;
@@ -689,17 +710,27 @@ public:
         if (persistence_worker_.joinable()) persistence_worker_.join();
     }
 
+    // The alias work a publication performs under the admission lock. Admitting an image and
+    // taking its alias are one operation: a stable prefix is reachable only through its alias, so
+    // a split would leave an unreachable image in L2 whenever the alias step failed.
+    struct AliasTarget {
+        AliasKind kind = AliasKind::Session;
+        std::string name;
+        std::optional<ContentId> expected_head;
+        std::optional<std::uint64_t> expected_generation;
+    };
+
     SessionPublishResult store_impl(std::shared_ptr<const ContinuationImage> image,
                                      const StoreOptions& options,
                                      bool persist_l3,
-                                     std::optional<std::string_view> cas_session   = std::nullopt,
-                                    const std::optional<ContentId>& expected_head = std::nullopt,
-                                    std::optional<std::uint64_t> expected_generation =
-                                         std::nullopt) {
+                                     std::optional<AliasTarget> alias = std::nullopt) {
         const auto admission_started = std::chrono::steady_clock::now();
-        if (cas_session && (cas_session->empty() || cas_session->starts_with(kStableAliasPrefix) ||
-                            (expected_head && !expected_head->valid()))) {
-            throw std::invalid_argument("invalid session publication");
+        if (alias &&
+            (alias->name.empty() || alias->name.size() > kMaxSessionNameBytes ||
+             (alias->expected_head && !alias->expected_head->valid()) ||
+             (alias->kind == AliasKind::StablePrefix &&
+              (alias->expected_head || alias->expected_generation)))) {
+            return {.outcome = SessionPublishOutcome::InvalidAlias};
         }
         const ContentId id = hash_serialized(*image);
         const std::size_t image_bytes = continuation_image_bytes(*image);
@@ -720,6 +751,15 @@ public:
         }
         const auto now = config_.now();
         std::lock_guard lock(mu_);
+        // A name owned at one kind never silently acquires the other kind's semantics: a session
+        // head would gain rollback-free write-once ownership, and a stable prefix would gain
+        // mutable history. Refuse before admitting anything.
+        if (alias) {
+            const auto owner = sessions_.find(alias->name);
+            if (owner != sessions_.end() && owner->second.kind != alias->kind) {
+                return {.id = id, .outcome = SessionPublishOutcome::InvalidAlias};
+            }
+        }
         auto found = catalog_.find(id.hex);
         if (found != catalog_.end()) {
             expire_l2(found->first);
@@ -761,7 +801,7 @@ public:
         // A session publication is the newest state of a live conversation, so it must not be the
         // victim of the eviction pass its own admission triggers: losing it forfeits the alias
         // advance and forces the next turn to prefill from nothing.
-        evict_l2(cas_session ? std::string_view(id.hex) : std::string_view());
+        evict_l2(alias ? std::string_view(id.hex) : std::string_view());
         evict_l3();
         found = catalog_.find(id.hex);
         const bool stored =
@@ -775,25 +815,47 @@ public:
                                        : SessionPublishOutcome::RejectedTooLarge;
         }
         if (stored) {
-            if (cas_session) {
-                const auto existing = sessions_.find(std::string(*cas_session));
+            if (alias && alias->kind == AliasKind::StablePrefix) {
+                const auto existing = sessions_.find(alias->name);
+                if (existing == sessions_.end()) {
+                    sessions_.emplace(alias->name,
+                                      AliasEntry{AliasKind::StablePrefix, {id}});
+                    ++alias_generations_[alias->name];
+                    alias_advanced = true;
+                    if (persist_l3 || found->second.durable) {
+                        persist_session(alias->name, sessions_.at(alias->name));
+                    }
+                } else if (existing->second.history.size() == 1 &&
+                           existing->second.history.front() == id) {
+                    alias_advanced = true;
+                } else {
+                    outcome = SessionPublishOutcome::AliasAlreadyOwned;
+                }
+            } else if (alias) {
+                const auto existing = sessions_.find(alias->name);
                 const std::optional<ContentId> current =
-                    existing == sessions_.end() || existing->second.empty()
+                    existing == sessions_.end() || existing->second.history.empty()
                         ? std::nullopt
-                        : std::optional<ContentId>(existing->second.back());
-                const auto generation = alias_generations_.find(std::string(*cas_session));
+                        : std::optional<ContentId>(existing->second.history.back());
+                const auto generation = alias_generations_.find(alias->name);
                 const std::uint64_t current_generation =
                     generation == alias_generations_.end() ? 0 : generation->second;
-                if (current != expected_head) {
+                if (current != alias->expected_head) {
                     outcome = SessionPublishOutcome::HeadMoved;
-                } else if (expected_generation && *expected_generation != current_generation) {
+                } else if (alias->expected_generation &&
+                           *alias->expected_generation != current_generation) {
                     outcome = SessionPublishOutcome::GenerationMoved;
                 } else {
-                    update_session(std::string(*cas_session), id, persist_l3);
+                    update_session(alias->name, id, persist_l3);
                     alias_advanced = true;
                 }
             } else if (options.session) {
                 update_session(*options.session, id, persist_l3);
+            }
+            // A stable prefix has no route but its alias, so an admission that did not take one
+            // would only displace reachable entries under L2 pressure.
+            if (alias && alias->kind == AliasKind::StablePrefix && !alias_advanced) {
+                drop_unreferenced_locked(id.hex);
             }
         } else if (found != catalog_.end()) {
             catalog_.erase(found);
@@ -839,8 +901,11 @@ public:
         StoreOptions without_session = options;
         without_session.session.reset();
         auto shared = std::make_shared<const ContinuationImage>(image);
-        auto result = store_impl(shared, without_session, true, session, expected_head,
-                                 expected_generation);
+        auto result = store_impl(shared, without_session, true,
+                                 AliasTarget{.kind                = AliasKind::Session,
+                                             .name                = std::string(session),
+                                             .expected_head       = expected_head,
+                                             .expected_generation = expected_generation});
         if (!promote_image(result.id, std::move(shared))) {
             if (discard_unstored(result.id.hex)) {
                 result.stored = false;
@@ -864,7 +929,10 @@ public:
         StoreOptions without_session = options;
         without_session.session.reset();
         return store_impl(std::make_shared<const ContinuationImage>(image), without_session, false,
-                          session, expected_head, expected_generation);
+                          AliasTarget{.kind                = AliasKind::Session,
+                                      .name                = std::string(session),
+                                      .expected_head       = expected_head,
+                                      .expected_generation = expected_generation});
     }
 
     SessionPublishResult publish_session_l2(
@@ -880,7 +948,11 @@ public:
         StoreOptions without_session = options;
         without_session.session.reset();
         return store_impl(std::make_shared<const ContinuationImage>(std::move(image)),
-                          without_session, false, session, expected_head, expected_generation);
+                          without_session, false,
+                          AliasTarget{.kind                = AliasKind::Session,
+                                      .name                = std::string(session),
+                                      .expected_head       = expected_head,
+                                      .expected_generation = expected_generation});
     }
 
     CacheLookupResult lookup_shared(const ContentId& id) {
@@ -1008,14 +1080,14 @@ public:
     std::optional<ContentId> session_current(std::string_view name) const {
         std::lock_guard lock(mu_);
         const auto it = sessions_.find(std::string(name));
-        if (it == sessions_.end() || it->second.empty()) return std::nullopt;
-        return it->second.back();
+        if (it == sessions_.end() || it->second.history.empty()) return std::nullopt;
+        return it->second.history.back();
     }
 
     std::vector<ContentId> session_history(std::string_view name) const {
         std::lock_guard lock(mu_);
         const auto it = sessions_.find(std::string(name));
-        return it == sessions_.end() ? std::vector<ContentId>{} : it->second;
+        return it == sessions_.end() ? std::vector<ContentId>{} : it->second.history;
     }
 
     SessionCandidates session_candidates(std::string_view name) {
@@ -1027,7 +1099,7 @@ public:
             const auto generation = alias_generations_.find(key);
             result.generation = generation == alias_generations_.end() ? 0 : generation->second;
             const auto history = sessions_.find(key);
-            if (history != sessions_.end()) ids = history->second;
+            if (history != sessions_.end()) ids = history->second.history;
         }
         result.newest_to_oldest.reserve(ids.size());
         for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
@@ -1076,41 +1148,13 @@ public:
         return lookup_shared(candidate.id);
     }
 
-    SessionPublishResult publish_immutable_alias(std::string_view name, const ContentId& id) {
-        const auto reject = [&](SessionPublishOutcome outcome) {
-            return SessionPublishResult{
-                .id = id, .stored = false, .alias_advanced = false, .outcome = outcome};
-        };
-        if (!name.starts_with(kStableAliasPrefix) || !id.valid()) {
-            return reject(SessionPublishOutcome::RejectedTooLarge);
-        }
-        std::lock_guard lock(mu_);
-        expire_l2(id.hex);
-        const auto entry = catalog_.find(id.hex);
-        if (entry == catalog_.end() ||
-            (entry->second.durable &&
-             (expired_l3(entry->second) || pending_l3_drops_.contains(id.hex)) &&
-             !l2_.contains(id.hex)) ||
-            (!entry->second.durable && !l2_.contains(id.hex))) {
-            return reject(SessionPublishOutcome::EvictedOnAdmission);
-        }
-        const std::string key(name);
-        const auto existing = sessions_.find(key);
-        if (existing != sessions_.end()) {
-            const bool same = existing->second.size() == 1 && existing->second.front() == id;
-            return SessionPublishResult{.id             = id,
-                                        .stored         = true,
-                                        .alias_advanced = same,
-                                        .outcome = same ? SessionPublishOutcome::Advanced
-                                                        : SessionPublishOutcome::AliasAlreadyOwned};
-        }
-        sessions_.emplace(key, std::vector<ContentId>{id});
-        ++alias_generations_[key];
-        if (entry->second.durable) persist_session(key, sessions_.at(key));
-        return SessionPublishResult{.id             = id,
-                                    .stored         = true,
-                                    .alias_advanced = true,
-                                    .outcome        = SessionPublishOutcome::Advanced};
+    SessionPublishResult publish_stable_alias(ContinuationImage&& image, std::string_view name,
+                                              const StoreOptions& options) {
+        StoreOptions without_session = options;
+        without_session.session.reset();
+        return store_impl(std::make_shared<const ContinuationImage>(std::move(image)),
+                          without_session, false,
+                          AliasTarget{.kind = AliasKind::StablePrefix, .name = std::string(name)});
     }
 
     bool promote(const ContentId& id) {
@@ -1270,15 +1314,37 @@ public:
         std::vector<AliasRecord> records;
         {
             std::lock_guard lock(mu_);
-            for (const auto& [name, history] : sessions_) {
-                if (std::find(history.begin(), history.end(), ContentId{id}) != history.end()) {
+            for (const auto& [name, entry] : sessions_) {
+                if (std::find(entry.history.begin(), entry.history.end(), ContentId{id}) !=
+                    entry.history.end()) {
                     try {
-                        records.push_back(make_alias_record(name, history));
+                        records.push_back(make_alias_record(name, entry));
                     } catch (...) {}
                 }
             }
         }
         for (const auto& record : records) (void)write_alias_record_outside_lock(record);
+    }
+
+    // Requires mu_. Drops an admitted image that no alias names, nobody holds, and L3 does not
+    // own. Content addressing means the id may predate this call, so every reference is checked
+    // rather than assuming the caller introduced it.
+    void drop_unreferenced_locked(const std::string& id) {
+        if (pins_.contains(id)) return;
+        for (const auto& [name, entry] : sessions_) {
+            if (std::find(entry.history.begin(), entry.history.end(), ContentId{id}) !=
+                entry.history.end()) {
+                return;
+            }
+        }
+        const auto found = catalog_.find(id);
+        if (found == catalog_.end() || found->second.durable) return;
+        const auto hot = l2_.find(id);
+        if (hot != l2_.end()) {
+            l2_bytes_ -= hot->second.bytes;
+            l2_.erase(hot);
+        }
+        catalog_.erase(found);
     }
 
     bool discard_unstored(const std::string& id) {
@@ -1291,23 +1357,23 @@ public:
     }
 
     bool queue_persistence(std::string_view name, const ContentId& id, std::uint64_t tokens,
-                           bool immutable) {
-        if (!l3_enabled() || name.empty() || !id.valid() ||
-            (immutable != name.starts_with(kStableAliasPrefix))) {
-            return false;
-        }
+                           AliasKind kind) {
+        if (!l3_enabled() || name.empty() || !id.valid()) { return false; }
         std::lock_guard lock(mu_);
         expire_l2(id.hex);
         const auto entry = catalog_.find(id.hex);
         const auto alias = sessions_.find(std::string(name));
         if (entry == catalog_.end() || !l2_.contains(id.hex) || alias == sessions_.end() ||
-            alias->second.empty() || alias->second.back() != id) {
+            alias->second.kind != kind || alias->second.history.empty() ||
+            alias->second.history.back() != id) {
             return false;
         }
+        const bool immutable = kind == AliasKind::StablePrefix;
         ++persistence_queued_;
         const std::string key(name);
         if (!persisted_.contains(key)) {
-            for (auto it = alias->second.rbegin(); it != alias->second.rend(); ++it) {
+            for (auto it = alias->second.history.rbegin(); it != alias->second.history.rend();
+                 ++it) {
                 if (*it == id) continue;
                 const auto prior = catalog_.find(it->hex);
                 if (prior != catalog_.end() && prior->second.durable &&
@@ -1343,13 +1409,15 @@ public:
     }
 
     bool rollback(std::string_view name, std::size_t depth) {
-        if (name.starts_with(kStableAliasPrefix)) return false;
         std::lock_guard lock(mu_);
         auto it = sessions_.find(std::string(name));
-        if (it == sessions_.end() || depth >= it->second.size())
+        // A stable prefix is write-once: it has no history to roll back to.
+        if (it != sessions_.end() && it->second.kind != AliasKind::Session) return false;
+        if (it == sessions_.end() || depth >= it->second.history.size())
             return depth == 0 && it != sessions_.end();
         if (depth == 0) return true;
-        it->second.erase(it->second.end() - static_cast<std::ptrdiff_t>(depth), it->second.end());
+        it->second.history.erase(it->second.history.end() - static_cast<std::ptrdiff_t>(depth),
+                                 it->second.history.end());
         ++alias_generations_[it->first];
         persist_session(it->first, it->second);
         return true;
@@ -1357,7 +1425,7 @@ public:
 
     SessionRollbackResult rollback_to(std::string_view name, const ContentId& id,
                                       std::uint64_t expected_generation) {
-        if (name.starts_with(kStableAliasPrefix) || !id.valid()) return {};
+        if (!id.valid()) return {};
         SessionRollbackResult result;
         {
             std::lock_guard lock(mu_);
@@ -1368,16 +1436,20 @@ public:
             result.generation = current_generation;
             if (current_generation != expected_generation) return result;
             auto session = sessions_.find(key);
-            if (session == sessions_.end()) return result;
-            const auto selected = std::find(session->second.begin(), session->second.end(), id);
-            if (selected == session->second.end()) return result;
+            if (session == sessions_.end() || session->second.kind != AliasKind::Session) {
+                return result;
+            }
+            auto& history       = session->second.history;
+            const auto selected = std::find(history.begin(), history.end(), id);
+            if (selected == history.end()) return result;
             if (l3_enabled()) {
-                const std::vector<ContentId> rolled_back(session->second.begin(), selected + 1);
-                AliasRecord record = make_alias_record(key, rolled_back);
-                record.generation  = current_generation + 1;
+                AliasRecord record = make_alias_record(
+                    key, AliasEntry{AliasKind::Session,
+                                    std::vector<ContentId>(history.begin(), selected + 1)});
+                record.generation = current_generation + 1;
                 pending_alias_writes_.insert_or_assign(key, std::move(record));
             }
-            session->second.erase(selected + 1, session->second.end());
+            history.erase(selected + 1, history.end());
             result.generation = ++alias_generations_[key];
             result.rolled_back = true;
             if (l3_enabled()) persistence_cv_.notify_one();
@@ -1600,20 +1672,20 @@ private:
                     sha256(reinterpret_cast<const std::uint8_t*>(alias.session.data()),
                            alias.session.size()))
                     throw std::runtime_error("alias filename mismatch");
-                const auto original_size = alias.history.size();
-                std::erase_if(alias.history, [&](const ContentId& id) {
+                const auto original_size = alias.entry.history.size();
+                std::erase_if(alias.entry.history, [&](const ContentId& id) {
                     const auto found = catalog_.find(id.hex);
                     return found == catalog_.end() || !found->second.durable ||
                             expired_l3(found->second);
                 });
-                if (alias.history.empty()) {
+                if (alias.entry.history.empty()) {
                     std::error_code remove_ec;
                     if (std::filesystem::remove(path, remove_ec)) sync_directory(aliases_);
                 } else {
-                    sessions_.insert_or_assign(alias.session, alias.history);
+                    sessions_.insert_or_assign(alias.session, alias.entry);
                     ++alias_generations_[alias.session];
-                    if (alias.history.size() != original_size)
-                        persist_session(alias.session, alias.history);
+                    if (alias.entry.history.size() != original_size)
+                        persist_session(alias.session, alias.entry);
                 }
             } catch (...) {
                 // Alias corruption is isolated control-data loss and must never prevent startup.
@@ -1729,9 +1801,9 @@ private:
             lock.lock();
             bool alias_current  = false;
             const auto current  = sessions_.find(alias);
-            if (current != sessions_.end() && !current->second.empty()) {
-                alias_current = item.immutable ? current->second.front() == item.id
-                                               : current->second.back() == item.id;
+            if (current != sessions_.end() && !current->second.history.empty()) {
+                alias_current = item.immutable ? current->second.history.front() == item.id
+                                               : current->second.history.back() == item.id;
             }
             if (!alias_current) {
                 unpin_locked(item.id.hex);
@@ -1745,9 +1817,10 @@ private:
                 const bool persisted = record && write_alias_record_outside_lock(*record);
                 lock.lock();
                 const auto latest = sessions_.find(alias);
-                const bool still_current = latest != sessions_.end() && !latest->second.empty() &&
-                                           (item.immutable ? latest->second.front() == item.id
-                                                           : latest->second.back() == item.id);
+                const bool still_current =
+                    latest != sessions_.end() && !latest->second.history.empty() &&
+                    (item.immutable ? latest->second.history.front() == item.id
+                                    : latest->second.history.back() == item.id);
                 if (!still_current) {
                     unpin_locked(item.id.hex);
                     evict_l2();
@@ -1989,8 +2062,12 @@ private:
     }
 
     void update_session(const std::string& name, const ContentId& id, bool persist) {
-        if (name.starts_with(kStableAliasPrefix)) return;
-        auto& history = sessions_[name];
+        const auto existing = sessions_.find(name);
+        // A write-once stable prefix never becomes a mutable conversation head.
+        if (existing != sessions_.end() && existing->second.kind != AliasKind::Session) return;
+        auto& entry   = sessions_[name];
+        entry.kind    = AliasKind::Session;
+        auto& history = entry.history;
         if (!history.empty() && history.back() == id) return;
         history.push_back(id);
         if (history.size() > config_.session_history_depth)
@@ -1998,7 +2075,7 @@ private:
                           history.begin() + static_cast<std::ptrdiff_t>(
                                                 history.size() - config_.session_history_depth));
         ++alias_generations_[name];
-        if (persist) persist_session(name, history);
+        if (persist) persist_session(name, entry);
     }
 
     struct AliasRecord {
@@ -2008,11 +2085,10 @@ private:
         std::optional<Bytes> bytes;
     };
 
-    AliasRecord make_alias_record(const std::string& name,
-                                  const std::vector<ContentId>& history) const {
+    AliasRecord make_alias_record(const std::string& name, const AliasEntry& entry) const {
         std::vector<ContentId> durable;
-        durable.reserve(history.size());
-        for (const auto& id : history) {
+        durable.reserve(entry.history.size());
+        for (const auto& id : entry.history) {
             const auto found = catalog_.find(id.hex);
             if (found != catalog_.end() && l3_available(id.hex, found->second)) {
                 durable.push_back(id);
@@ -2026,7 +2102,7 @@ private:
                                     (sha256(reinterpret_cast<const std::uint8_t*>(name.data()),
                                             name.size()) +
                                      ".alias")};
-        if (!durable.empty()) record.bytes = encode_alias(name, durable);
+        if (!durable.empty()) record.bytes = encode_alias(name, AliasEntry{entry.kind, durable});
         return record;
     }
 
@@ -2057,18 +2133,17 @@ private:
             const auto current = sessions_.find(record.name);
             try {
                 record = make_alias_record(
-                    record.name,
-                    current == sessions_.end() ? std::vector<ContentId>{} : current->second);
+                    record.name, current == sessions_.end() ? AliasEntry{} : current->second);
             } catch (...) {
                 return false;
             }
         }
     }
 
-    bool persist_session(const std::string& name, const std::vector<ContentId>& history) const {
+    bool persist_session(const std::string& name, const AliasEntry& entry) const {
         if (!l3_enabled()) return false;
         try {
-            return write_alias_record(make_alias_record(name, history));
+            return write_alias_record(make_alias_record(name, entry));
         } catch (...) {
             // Session persistence is opportunistic; inference and the in-memory alias remain valid.
             return false;
@@ -2077,15 +2152,16 @@ private:
 
     void remove_from_sessions(const std::string& id, bool persist = true) {
         for (auto it = sessions_.begin(); it != sessions_.end();) {
-            const auto old_size = it->second.size();
-            std::erase_if(it->second, [&](const ContentId& value) { return value.hex == id; });
-            if (it->second.size() == old_size) {
+            const auto old_size = it->second.history.size();
+            std::erase_if(it->second.history,
+                          [&](const ContentId& value) { return value.hex == id; });
+            if (it->second.history.size() == old_size) {
                 ++it;
                 continue;
             }
             ++alias_generations_[it->first];
             if (persist) persist_session(it->first, it->second);
-            if (it->second.empty())
+            if (it->second.history.empty())
                 it = sessions_.erase(it);
             else
                 ++it;
@@ -2099,7 +2175,7 @@ private:
     std::unordered_map<std::string, ChunkRef> chunk_refs_;
     std::unordered_map<std::string, std::size_t> orphan_files_;
     std::unordered_map<std::string, Hot> l2_;
-    std::unordered_map<std::string, std::vector<ContentId>> sessions_;
+    std::unordered_map<std::string, AliasEntry> sessions_;
     std::unordered_map<std::string, std::uint64_t> alias_generations_;
     std::unordered_map<std::string, std::size_t> pins_;
     std::unordered_set<std::string> pending_l3_drops_;
@@ -2207,14 +2283,15 @@ SessionRollbackResult ContinuationCache::rollback_session_to(
     return impl_->rollback_to(s, id, expected_generation);
 }
 
-SessionPublishResult ContinuationCache::publish_immutable_alias(std::string_view s,
-                                                                const ContentId& id) {
-    return impl_->publish_immutable_alias(s, id);
+SessionPublishResult ContinuationCache::publish_stable_alias(ContinuationImage&& image,
+                                                            std::string_view alias,
+                                                            const StoreOptions& options) {
+    return impl_->publish_stable_alias(std::move(image), alias, options);
 }
 
 bool ContinuationCache::queue_persistence(std::string_view alias, const ContentId& id,
-                                          std::uint64_t tokens, bool immutable) {
-    return impl_->queue_persistence(alias, id, tokens, immutable);
+                                          std::uint64_t tokens, AliasKind kind) {
+    return impl_->queue_persistence(alias, id, tokens, kind);
 }
 
 bool ContinuationCache::pin(const ContentId& id) { return impl_->pin(id); }

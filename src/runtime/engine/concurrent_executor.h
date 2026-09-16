@@ -877,18 +877,17 @@ private:
                 };
                 if (item.immutable) {
                     const auto frontier_tokens = item.image.frontier_tokens;
-                    const cache::ContentId id =
-                        continuation_cache_->admit(std::move(item.image), options);
-                    const auto result =
-                        continuation_cache_->publish_immutable_alias(item.session, id);
+                    const auto result = continuation_cache_->publish_stable_alias(
+                        std::move(item.image), item.session, options);
                     publication_outcome = result.outcome;
                     if (result.alias_advanced) {
                         status = PublicationStatus::Success;
                         (void)continuation_cache_->queue_persistence(
-                            item.session, id, frontier_tokens, true);
+                            item.session, result.id, frontier_tokens,
+                            cache::AliasKind::StablePrefix);
                     } else if (result.outcome == cache::SessionPublishOutcome::AliasAlreadyOwned) {
-                        // Another lane already owns this write-once stable prefix. The image is
-                        // admitted and reusable; only the alias was contested.
+                        // Another lane already owns this write-once stable prefix. The alias it
+                        // holds serves this prompt just as well, so the contest is not a failure.
                         status = PublicationStatus::Superseded;
                     }
                 } else {
@@ -898,7 +897,7 @@ private:
                         item.expected_generation);
                     if (result.alias_advanced) {
                         (void)continuation_cache_->queue_persistence(
-                            item.session, result.id, frontier_tokens);
+                            item.session, result.id, frontier_tokens, cache::AliasKind::Session);
                     }
                     status = result.alias_advanced ? PublicationStatus::Success
                                                    : (result.stored ? PublicationStatus::Superseded
@@ -939,8 +938,16 @@ private:
                         continuation_stats_.publication_failed_lineage.fetch_add(
                             1, std::memory_order_relaxed);
                         break;
-                    case cache::SessionPublishOutcome::RejectedTooLarge:
+                    // Only a real budget rejection reaches the capacity counter. A malformed or
+                    // mis-kinded alias is a caller defect, and Advanced here is a logic surprise;
+                    // counting either as capacity once reported a structural publication bug as
+                    // pressure on a tier that was almost empty.
+                    case cache::SessionPublishOutcome::InvalidAlias:
                     case cache::SessionPublishOutcome::Advanced:
+                        continuation_stats_.publication_failed_error.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    case cache::SessionPublishOutcome::RejectedTooLarge:
                         continuation_stats_.publication_failed_capacity.fetch_add(
                             1, std::memory_order_relaxed);
                         break;
@@ -1268,17 +1275,23 @@ private:
                                               ? ContinuationAliasKind::Session
                                               : (stable_alias ? ContinuationAliasKind::StablePrefix
                                                               : ContinuationAliasKind::None);
-                if (!options.routing_hint && !stable_alias) {
-                    // Nothing about this prompt can ever be cached under any alias.
-                    continuation.final_miss_reason = ContinuationMissReason::NoAlias;
-                } else if (routed_continuation.status ==
-                               cache::CacheLookupStatus::UnavailableOrCorrupt ||
-                       stable_continuation.status == cache::CacheLookupStatus::UnavailableOrCorrupt) {
+                const bool any_candidate =
+                    routed_continuation.image || !routed_continuation.candidates.empty() ||
+                    stable_continuation.image || !stable_continuation.candidates.empty();
+                if (routed_continuation.status == cache::CacheLookupStatus::UnavailableOrCorrupt ||
+                    stable_continuation.status == cache::CacheLookupStatus::UnavailableOrCorrupt) {
                     continuation.final_miss_reason =
                         ContinuationMissReason::EntryUnavailableOrCorrupt;
+                } else if (!any_candidate) {
+                    // No alias this prompt could use names anything, either because the prompt is
+                    // unaliasable or because nothing was ever published under the aliases it has.
+                    // Both are the same fact for a reader: there was nothing to restore from. A
+                    // stable flight that resolves later overrides this with what it observes,
+                    // since every concrete candidate outcome outranks NoAlias.
+                    continuation.final_miss_reason = ContinuationMissReason::NoAlias;
                 } else {
-                    // An alias exists. Until restoration actually evaluates a candidate this is
-                    // an absence of evidence, not evidence that nothing was cacheable.
+                    // A candidate exists. Until restoration actually evaluates it this is an
+                    // absence of evidence, not evidence that nothing was cacheable.
                     continuation.final_miss_reason = ContinuationMissReason::NotAttempted;
                 }
             }

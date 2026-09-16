@@ -337,13 +337,13 @@ void test_async_coalescing_shutdown_and_restart() {
         auto first_image = image(69);
         first_image.frontier_tokens = 100;
         const auto first = cache.publish_session_l2(first_image, "coalesced", std::nullopt);
-        check(first.alias_advanced && cache.queue_persistence("coalesced", first.id, 100),
+        check(first.alias_advanced && cache.queue_persistence("coalesced", first.id, 100, AliasKind::Session),
               "first L2 session state queues for persistence");
         auto latest_image = image(70, first.id);
         latest_image.frontier_tokens = 150;
         const auto second = cache.publish_session_l2(latest_image, "coalesced", first.id);
         latest = second.id;
-        check(second.alias_advanced && cache.queue_persistence("coalesced", second.id, 150),
+        check(second.alias_advanced && cache.queue_persistence("coalesced", second.id, 150, AliasKind::Session),
               "newer same-session state replaces the pending persistence candidate");
         const auto stats = cache.stats();
         check(cache.session_current("coalesced") == latest && stats.l3_entries == 0,
@@ -370,22 +370,27 @@ void test_async_stable_alias_first_writer_and_restart() {
                        .l3_byte_budget = 1 << 20,
                        .persist_interval = std::chrono::hours(1),
                        .persist_min_tokens = 100000};
-    const std::string alias = std::string(kStableAliasPrefix) + std::string(64, 'b');
+    // The engine namespaces every alias by the adapter that produced its state, so this is the
+    // shape a stable alias actually has in production. Deciding the alias kind from a leading
+    // string made exactly this shape unpublishable while the unscoped shape kept working.
+    const std::string alias =
+        std::string(64, 'f') + '\x1f' + "@stable/v1/" + std::string(64, 'b');
     const auto first_image = image(71);
     const auto second_image = image(72);
-    ContentId first;
+    const ContentId first = content_id(first_image);
     {
         ContinuationCache cache(config);
-        first = cache.admit(first_image);
-        const auto second = cache.admit(second_image);
-        check(cache.publish_immutable_alias(alias, first).alias_advanced &&
+        check(cache.publish_stable_alias(image(71), alias).alias_advanced &&
                   cache.session_current(alias) == first,
               "stable alias is promptly visible from L2");
-        const auto contested = cache.publish_immutable_alias(alias, second);
+        const auto contested = cache.publish_stable_alias(image(72), alias);
         check(!contested.alias_advanced &&
                   contested.outcome == SessionPublishOutcome::AliasAlreadyOwned,
               "L2 stable alias remains first-writer immutable and reports a lost race");
-        check(cache.queue_persistence(alias, first, first_image.frontier_tokens, true),
+        check(!cache.get(content_id(second_image)),
+              "an image that loses the alias race is not left unreachable in L2");
+        check(cache.queue_persistence(alias, first, first_image.frontier_tokens,
+                                      AliasKind::StablePrefix),
               "stable L2 alias queues its durable promotion");
     }
     ContinuationCache reopened(config);
@@ -938,7 +943,8 @@ void test_mutable_alias_replace_failure_is_reported_and_retried() {
         const auto next = cache.publish_session_l2(next_image, "replace", first.id);
         latest = next.id;
         check(next.alias_advanced && cache.queue_persistence("replace", latest,
-                                                             next_image.frontier_tokens),
+                                                             next_image.frontier_tokens,
+                                                             AliasKind::Session),
               "replacement candidate is queued");
         for (int i = 0; i != 400 && cache.stats().persistence_failures == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -954,28 +960,71 @@ void test_mutable_alias_replace_failure_is_reported_and_retried() {
 void test_immutable_alias_restart_and_classification_isolation() {
     TempDir dir;
     CacheConfig config{
-        .enable_l3 = true, .root = dir.path, .l2_byte_budget = 0, .l3_byte_budget = 1 << 20};
-    const std::string alias = std::string(kStableAliasPrefix) + std::string(64, 'a');
+        .enable_l3 = true, .root = dir.path, .l2_byte_budget = 1 << 20,
+        .l3_byte_budget = 1 << 20};
+    const std::string alias =
+        std::string(64, 'a') + '\x1f' + "@stable/v1/" + std::string(64, 'a');
     const auto first_image  = image(40);
     const auto second_image = image(41);
     const ContentId first   = content_id(first_image);
     {
         ContinuationCache cache(config);
-        check(cache.store(first_image) == first, "stable image is stored before alias publication");
-        check(cache.publish_immutable_alias(alias, first).alias_advanced,
+        check(cache.publish_stable_alias(image(40), alias).alias_advanced,
               "stable alias publishes once");
         const ContentId second = cache.store(second_image, StoreOptions{.session = alias});
         check(second != first && cache.session_current(alias) == first,
               "session classification cannot replace a reserved stable alias");
-        check(!cache.publish_immutable_alias(alias, second).alias_advanced,
+        check(!cache.publish_stable_alias(image(41), alias).alias_advanced,
               "stable alias cannot be rebound to another image");
         check(!cache.rollback_session(alias, 0), "stable alias cannot enter rollback machinery");
         check(cache.session_history(alias) == std::vector<ContentId>({first}),
               "stable alias has no history");
+        check(cache.queue_persistence(alias, first, first_image.frontier_tokens,
+                                      AliasKind::StablePrefix),
+              "stable alias queues its durable promotion");
     }
     ContinuationCache reopened(config);
     check(reopened.session_current(alias) == first && reopened.get(first) == first_image,
           "immutable stable alias survives L3 restart");
+}
+
+// An alias name is opaque to the cache: what it means is AliasKind, held as cache state. This
+// covers the production round trip end to end, because a stable prefix that cannot be published is
+// invisible to every later lookup and simply reprefills.
+void test_alias_kind_is_state_not_a_name_prefix() {
+    CacheConfig config{.l2_byte_budget = 1 << 20};
+    ContinuationCache cache(config);
+    const std::string scoped =
+        std::string(64, 'c') + '\x1f' + "@stable/v1/" + std::string(64, 'd');
+    const auto stable  = image(60);
+    const ContentId id = content_id(stable);
+    check(cache.publish_stable_alias(image(60), scoped).alias_advanced,
+          "an adapter-scoped stable alias publishes");
+
+    const auto candidates = cache.session_candidates(scoped);
+    check(candidates.newest_to_oldest.size() == 1 &&
+              candidates.newest_to_oldest.front().id == id &&
+              candidates.newest_to_oldest.front().source == CacheSource::L2 &&
+              candidates.newest_to_oldest.front().status == CacheLookupStatus::Hit,
+          "a scoped stable prefix is discoverable as an L2 candidate");
+    const auto resolved = cache.resolve_candidate(candidates.newest_to_oldest.front());
+    check(resolved.image && *resolved.image == stable && resolved.source == CacheSource::L2,
+          "a scoped stable prefix resolves its payload from L2");
+
+    const auto as_session = cache.publish_session_l2(image(61), scoped, std::nullopt);
+    check(!as_session.alias_advanced &&
+              as_session.outcome == SessionPublishOutcome::InvalidAlias &&
+              cache.session_current(scoped) == id,
+          "a stable alias cannot be republished as a mutable session");
+    check(!cache.get(content_id(image(61))),
+          "a refused publication admits nothing, so it cannot be a capacity outcome");
+
+    const std::string session_name = std::string(64, 'e') + '\x1f' + "agent-a";
+    check(cache.publish_session_l2(image(62), session_name, std::nullopt).alias_advanced,
+          "an adapter-scoped session alias publishes");
+    const auto as_stable = cache.publish_stable_alias(image(63), session_name);
+    check(!as_stable.alias_advanced && as_stable.outcome == SessionPublishOutcome::InvalidAlias,
+          "a session alias cannot be reclaimed as a write-once stable prefix");
 }
 
 void test_corrupt_and_torn_aliases_are_ignored() {
@@ -1244,6 +1293,7 @@ int main() {
     test_stale_alias_write_cannot_resurrect_rolled_back_state();
     test_mutable_alias_replace_failure_is_reported_and_retried();
     test_immutable_alias_restart_and_classification_isolation();
+    test_alias_kind_is_state_not_a_name_prefix();
     test_corrupt_and_torn_aliases_are_ignored();
     test_eviction_and_stale_alias_pruning();
     test_l2_only_never_touches_filesystem();

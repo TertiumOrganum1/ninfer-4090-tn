@@ -124,6 +124,25 @@ struct PersistedState {
                                    std::chrono::system_clock::time_point queued_at,
                                    std::chrono::system_clock::time_point now);
 
+// What an alias means, held as cache state rather than derived from the alias string. A caller may
+// transform an alias name however it needs to — the engine namespaces every alias by the LoRA
+// adapter that produced its state — and the cache never parses one. Deriving this from a string
+// prefix silently turned every adapter-scoped stable publication into a rejected malformed call.
+enum class AliasKind : std::uint8_t {
+    // A conversation head that advances under compare-and-swap and keeps bounded history.
+    Session,
+    // A write-once content-addressed leading prefix. One id, no history, no rollback.
+    StablePrefix,
+};
+
+[[nodiscard]] constexpr const char* alias_kind_name(AliasKind kind) {
+    switch (kind) {
+    case AliasKind::Session: return "session";
+    case AliasKind::StablePrefix: return "stable_prefix";
+    }
+    return "session";
+}
+
 // Why a session publication did not advance the alias. A publication that is not stored is a
 // capacity outcome; one that is stored but did not advance lost a CAS race.
 enum class SessionPublishOutcome : std::uint8_t {
@@ -135,13 +154,17 @@ enum class SessionPublishOutcome : std::uint8_t {
     // A write-once stable-prefix alias was already owned by a different image. Two lanes that
     // computed the same stable prefix do not produce the same image: the FP32 GDN recurrence
     // accumulates over each lane's own prefill chunk boundaries, so the content ids differ even
-    // though the prefix text is identical. The loser's state is still admitted and usable; it
-    // simply does not own the alias, so this is a lost race and not a failure.
+    // though the prefix text is identical. This is a lost race and not a failure, but the loser's
+    // image is discarded rather than kept: the alias is the only route to a stable prefix, so an
+    // unreachable admission would only displace reachable entries under L2 pressure.
     AliasAlreadyOwned,
     // The caller's image was parented on a head that is no longer the one it expected. Under
     // concurrent turns of one session this is an ordinary lost race, not a malformed call, so it
     // is reported rather than thrown: the publication worker re-derives the head and retries.
     LineageMismatch,
+    // The alias name is empty or oversized, or it is already owned at the other AliasKind. This is
+    // a caller defect, never a capacity or contention outcome, and must not be counted as one.
+    InvalidAlias,
 };
 
 [[nodiscard]] constexpr const char* session_publish_outcome_name(SessionPublishOutcome outcome) {
@@ -153,6 +176,7 @@ enum class SessionPublishOutcome : std::uint8_t {
     case SessionPublishOutcome::GenerationMoved: return "generation_moved";
     case SessionPublishOutcome::AliasAlreadyOwned: return "alias_already_owned";
     case SessionPublishOutcome::LineageMismatch: return "lineage_mismatch";
+    case SessionPublishOutcome::InvalidAlias: return "invalid_alias";
     }
     return "advanced";
 }
@@ -241,13 +265,17 @@ public:
     [[nodiscard]] SessionCandidates session_candidates(std::string_view session);
     // Resolves and verifies the complete immutable payload for a descriptor selected by preflight.
     [[nodiscard]] CacheLookupResult resolve_candidate(const SessionCandidateDescriptor& candidate);
-    // Reserved aliases are immutable selectors for content-addressed shared prefixes. Publishing
-    // an existing alias is a no-op, and unlike sessions it never creates history.
-    [[nodiscard]] SessionPublishResult publish_immutable_alias(std::string_view alias,
-                                                               const ContentId& id);
+    // Stable-prefix aliases are write-once selectors for content-addressed shared prefixes: unlike
+    // sessions they never create history and never advance to a second id. Admission and alias
+    // ownership happen under one lock, and an image that does not take the alias is discarded
+    // rather than left in L2 with nothing pointing at it.
+    [[nodiscard]] SessionPublishResult publish_stable_alias(ContinuationImage&& image,
+                                                            std::string_view alias,
+                                                            const StoreOptions& options = {});
     // Coalesces the latest admitted state per session/stable alias and promotes it asynchronously.
+    // kind must match the kind the alias was published at.
     [[nodiscard]] bool queue_persistence(std::string_view alias, const ContentId& id,
-                                         std::uint64_t frontier_tokens, bool immutable = false);
+                                         std::uint64_t frontier_tokens, AliasKind kind);
     // depth=0 is a no-op; depth=1 selects the previous image and forgets the newer alias history.
     [[nodiscard]] bool rollback_session(std::string_view session, std::size_t depth);
     // Destructively selects id only when the alias has not changed since session_candidates().
@@ -265,7 +293,5 @@ private:
 
 [[nodiscard]] ContentId content_id(const ContinuationImage& image);
 [[nodiscard]] std::size_t continuation_image_bytes(const ContinuationImage& image);
-
-inline constexpr std::string_view kStableAliasPrefix = "@stable/v1/";
 
 } // namespace ninfer::cache

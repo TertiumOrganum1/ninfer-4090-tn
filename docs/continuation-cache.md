@@ -193,12 +193,18 @@ not a defense against that user deliberately restoring or forging file metadata.
 currently enabled only on Linux, where the complete identity above is available from the opened
 file. Other platforms perform the full scan rather than weaken continuation compatibility.
 
-The current cache manifest magic is a development format version (`NICMAN04`), separate from the
+The current cache manifest magic is a development format version (`NICMAN05`), separate from the
 `.ninfer` artifact format. Unsupported/older manifests are ignored during discovery rather than
-migrated. Until a stable cache-format contract is published, expect development builds to require
-deleting or rotating the cache namespace; this loses acceleration, not model or response data.
+migrated, as are alias records below the current alias-record version. Until a stable cache-format
+contract is published, expect development builds to require deleting or rotating the cache
+namespace; this loses acceleration, not model or response data.
 
-`NICMAN04` is metadata-first: in addition to image bytes, TTLs, cost, and chunk inventory, every
+An alias record carries its `AliasKind` — mutable routed session or write-once stable prefix —
+alongside its name and history. The kind is cache state, never inferred from the alias name, so the
+engine is free to namespace a name by the adapter that produced its state without changing what the
+name means.
+
+`NICMAN05` is metadata-first: in addition to image bytes, TTLs, cost, and chunk inventory, every
 manifest carries the exact opaque runtime compatibility key, continuation image format version,
 frontier and boundary token depths, and 32-byte SHA-256 digests of the target's canonical exact
 prefix identity at those depths. Session history lookup returns these bounded descriptors without
@@ -206,8 +212,8 @@ reading image chunks. Qwen rejects incompatible or nonmatching descriptors, orde
 by effective depth, and resolves a payload only while it can still improve the selected resident,
 stable-prefix, or routed candidate. A digest match is only a negative-filter pass: complete payload
 SHA-256, manifest/image metadata agreement, and exact image preflight remain required before import
-or destructive history rollback. The corresponding complete-image framing is `NICIMG02`, with Qwen
-target image version `2`; old cache namespaces must be deleted rather than migrated.
+or destructive history rollback. The corresponding complete-image framing is `NICIMG03`, with Qwen
+target image version `3`; old cache namespaces must be deleted rather than migrated.
 
 ## OpenCode examples
 
@@ -317,7 +323,12 @@ deployed workload rather than treating these values as fixed costs.
 - `ninfer:continuation_restore_successes_total`, `...restore_failures_total`,
   `...restored_tokens_total`, and `...restored_bytes_total`;
 - `ninfer:continuation_publication_successes_total`, `...publication_failures_total`, and
-  `...publication_superseded_total`;
+  `...publication_superseded_total`, plus the five attribution series that sum to the failures:
+  `...publication_failed_capacity_total`, `...failed_evicted_total`, `...failed_alias_moved_total`,
+  `...failed_lineage_total`, and `...failed_error_total`. `capacity` means one thing only: the
+  image alone exceeded the L2 byte budget. An alias refused as malformed or as already owned at
+  the other `AliasKind` is a caller defect and counts as `error`, so a nonzero `capacity` against
+  an L2 tier with headroom is not a normal reading;
 - `ninfer:continuation_persistence_queued_total`, `...coalesced_total`,
   `...successes_total`, and `...failures_total`;
 - `ninfer:continuation_preparation_decoded_total`, `...preparation_hits_total`, and
@@ -347,8 +358,11 @@ deployed workload rather than treating these values as fixed costs.
   `...restored_bytes_total` series, plus `...session_restores_total` and
   `...stable_prefix_restores_total`;
 - one fixed `ninfer:continuation_miss_<reason>_total` series for each stable terminal reason:
-  `disabled`, `no_alias`, `entry_unavailable_or_corrupt`, `not_deeper`, `preflight_rejected`,
-  `rollback_conflict`, `no_lane`, and `restore_failed`;
+  `disabled`, `no_alias`, `not_attempted`, `entry_unavailable_or_corrupt`, `not_deeper`,
+  `preflight_rejected`, `rollback_conflict`, `no_lane`, and `restore_failed`. `no_alias` means
+  nothing was found to restore from, whether because the prompt is unaliasable or because no
+  candidate exists under the aliases it has; `not_attempted` means a candidate existed and no
+  restore step ever evaluated it, which is a scheduling observation rather than a cache one;
 - cumulative microseconds and operation counts for L2/L3 lookup and restore, preflight,
   `l2_admission`, and `l3_persistence`.
 
