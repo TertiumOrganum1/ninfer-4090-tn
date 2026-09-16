@@ -1764,6 +1764,10 @@ private:
             // that prefix restores the image and rewinds to the checkpoint, and a request sharing
             // the generated turn as well appends at the frontier.
             auto image = instance_.program->export_continuation_lane(lane);
+            // The cache is content-addressed over the serialized image, parent included, so the
+            // boundary copy carries the session's parent too: both aliases then resolve to one L2
+            // payload instead of storing the same state twice.
+            if (publish_session) { image.parent_id = request->routed_continuation.id; }
             if (publish_boundary && image.boundary_tokens == frontier_boundary->depth) {
                 auto ticket = queue_publication(publish_session ? image : std::move(image),
                                                 frontier_boundary->alias, std::nullopt,
