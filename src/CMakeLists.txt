@@ -275,9 +275,9 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86" OR CMAKE_CUDA_ARCHITECTURES STREQUAL "
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM86=1)
 endif()
-# Compile each token width independently. Combining T=1..6 generates nearly
-# 300 MiB of PTX and makes one ptxas process consume several GiB for minutes.
-foreach(token RANGE 1 6)
+# Compile each token width independently. Combining T=1..8 generates hundreds
+# of MiB of PTX and makes one ptxas process consume several GiB for minutes.
+foreach(token RANGE 1 8)
   add_library(ninfer_gqa_decode_t${token} STATIC
     ops/launcher/gqa_attention_decode.cu)
   ninfer_internal_includes(ninfer_gqa_decode_t${token})

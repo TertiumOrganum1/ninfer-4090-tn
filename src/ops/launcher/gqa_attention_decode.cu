@@ -16,8 +16,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-#if defined(NINFER_GQA_DECODE_TOKEN) && (NINFER_GQA_DECODE_TOKEN < 1 || NINFER_GQA_DECODE_TOKEN > 6)
-#    error "NINFER_GQA_DECODE_TOKEN must be in [1, 6]"
+#if defined(NINFER_GQA_DECODE_TOKEN) && (NINFER_GQA_DECODE_TOKEN < 1 || NINFER_GQA_DECODE_TOKEN > 8)
+#    error "NINFER_GQA_DECODE_TOKEN must be in [1, 8]"
 #endif
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
@@ -165,7 +165,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         };
-    if constexpr (TokenTile == 6) {
+    if constexpr (TokenTile >= 7 && Geometry::GroupSize != 6) {
+        // Four Q row tiles for the 35B group of eight; eight warps keep two consumers per tile.
+        launch.template operator()<8, 1, 32, true>();
+    } else if constexpr (TokenTile >= 6) {
+        // The 27B group of six still fits three Q row tiles at seven and eight tokens, so those
+        // widths share the six-token CTA shapes: shared memory depends on the row tiles only.
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
         if (implementation_window > 128 && implementation_window <= 160) {
@@ -237,11 +242,11 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 } // namespace
 
 #if !defined(NINFER_GQA_DECODE_TOKEN)
-bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
+bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 8; }
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 8 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -470,6 +475,8 @@ NINFER_DECLARE_TOKEN_LAUNCH(3);
 NINFER_DECLARE_TOKEN_LAUNCH(4);
 NINFER_DECLARE_TOKEN_LAUNCH(5);
 NINFER_DECLARE_TOKEN_LAUNCH(6);
+NINFER_DECLARE_TOKEN_LAUNCH(7);
+NINFER_DECLARE_TOKEN_LAUNCH(8);
 #    undef NINFER_DECLARE_TOKEN_LAUNCH
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -491,6 +498,8 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         NINFER_CALL_TOKEN_LAUNCH(4);
         NINFER_CALL_TOKEN_LAUNCH(5);
         NINFER_CALL_TOKEN_LAUNCH(6);
+        NINFER_CALL_TOKEN_LAUNCH(7);
+        NINFER_CALL_TOKEN_LAUNCH(8);
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
@@ -513,6 +522,8 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         NINFER_CALL_CACHED_TOKEN_LAUNCH(4);
         NINFER_CALL_CACHED_TOKEN_LAUNCH(5);
         NINFER_CALL_CACHED_TOKEN_LAUNCH(6);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(7);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(8);
     default:
         throw std::invalid_argument("gqa_attention_cached_small_t_launch: unsupported T");
     }

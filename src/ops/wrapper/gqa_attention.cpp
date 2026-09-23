@@ -17,7 +17,7 @@ namespace {
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
 constexpr float kExpectedScale                       = 0.0625f;
-constexpr std::int32_t kSmallTChunkTokens            = 6;
+constexpr std::int32_t kSmallTChunkTokens            = 8;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
