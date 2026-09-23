@@ -13,8 +13,10 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
-constexpr int kLargeBlockWaveCapacity = 1020;
+// One CTA per token: the 256-thread block wins only while the whole launch is resident. Six of
+// these CTAs fit per SM, so the wave ends at six times the SM count; past that the narrower
+// full-chunk block wins.
+constexpr int kLargeBlockWaveCapacity = 6 * kTargetSmCount;
 
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =

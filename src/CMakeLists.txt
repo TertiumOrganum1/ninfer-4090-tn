@@ -6,10 +6,12 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
 endfunction()
 
+# Every device symbol is defined and consumed inside one translation unit: there is no
+# extern __device__/__constant__, no cross-TU __global__ declaration, no device function pointer
+# and no dynamic parallelism. Relocatable device code is pure cost here - it makes ptxas assume
+# external linkage, which turns a dynamic-lane __shfl_sync into an out-of-line call with a stack
+# frame and spills and stops software pipelining of global loads across loop back edges.
 function(ninfer_cuda_archive target)
-  set_target_properties(${target} PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()

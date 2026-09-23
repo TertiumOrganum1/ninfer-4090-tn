@@ -32,7 +32,8 @@ constexpr int kDflashRotaryDim        = 128;
 constexpr int kDflashQHeads           = 32;
 constexpr int kDflashKHeads           = 8;
 constexpr int kTextChunkMaxTokens     = 1024;
-constexpr int kLargeBlockWaveCapacity = 1020;
+// Mirrors the production launcher: six 256-thread CTAs per SM bound the resident wave.
+constexpr int kLargeBlockWaveCapacity = 6 * ninfer::kTargetSmCount;
 constexpr float kTextTheta            = 1.0e7F;
 constexpr int kVisionHeadDim          = 72;
 constexpr int kVisionHeads            = 16;

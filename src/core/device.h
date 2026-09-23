@@ -10,6 +10,11 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// Streaming-multiprocessor count of the one part this build targets, the RTX 4090. Launch geometry
+// that deliberately fills exactly one resident wave is sized from this constant; __device__ launch
+// policies and the host launchers that mirror them bit-for-bit both read it at compile time.
+inline constexpr int kTargetSmCount = 128;
+
 struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
