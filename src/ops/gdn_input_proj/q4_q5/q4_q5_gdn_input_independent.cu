@@ -92,8 +92,30 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor
 }
 
 template <int Cols>
+void launch_q5_split4_rows(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                           cudaStream_t stream) {
+    constexpr int kThreads    = 4 * 32;
+    constexpr int kRows       = 2;
+    const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, kRows)), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_rows_kernel<Q5RowSplitSimtSchedule, kRows, Cols, 5, kHidden, true,
+                                             kValueRows><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld, kHidden, Cols,
+        weight.padded_shape[1], 5);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                       cudaStream_t stream) {
+    // From eight columns on, two rows per CTA share each widened activation.
+    if constexpr (Cols >= 8) {
+        launch_q5_split4_rows<Cols>(x, weight, value, z, stream);
+        return;
+    }
     constexpr int kThreads    = 4 * 32;
     const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(kValueZRows), 1u, 1u);
@@ -126,8 +148,14 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
     case 6:
         launch_q5_split4<6>(x, weight, value, z, stream);
         return;
+    case 7:
+        launch_q5_split4<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_q5_split4<8>(x, weight, value, z, stream);
+        return;
     default:
-        throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("GDN Q5 split4 requires T in [2,8]");
     }
 }
 
@@ -157,7 +185,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
+    if (x.ne[1] <= 8) {
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }

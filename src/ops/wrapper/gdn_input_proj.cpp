@@ -662,7 +662,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, 1);
         (void)resolve_q4_q5_conv_plan(max_width, 1);
-        if (max_width >= 7) {
+        if (max_width >= 9) {
             largest_materialized_width = max_width;
         } else if (min_width <= 4 && max_width >= 4) {
             largest_materialized_width = 4;

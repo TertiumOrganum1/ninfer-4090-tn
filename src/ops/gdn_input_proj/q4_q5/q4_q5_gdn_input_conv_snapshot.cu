@@ -212,18 +212,34 @@ void launch_q4_small_t(const Tensor& x, const Weight& qk_weight,
     }
 }
 
+// Same crossover as the independent value_z route: from eight columns on, two rows per CTA.
+template <int Tokens>
+constexpr int kQ5SmallTRows = Tokens >= 8 ? 2 : 1;
+
+template <int Tokens, class Publish, bool TriggerPdl, bool JoinPdl>
+constexpr auto q5_small_t_kernel() {
+    using Epilogue = Q5GdnSmallTEpilogue<Tokens, Publish>;
+    if constexpr (kQ5SmallTRows<Tokens> > 1) {
+        return q5_rowsplit_gemm_simt_split4_rows_kernel<Q5RowSplitSimtSchedule,
+                                                        kQ5SmallTRows<Tokens>, Tokens, 5, kHidden,
+                                                        true, kValueRows, Epilogue, TriggerPdl,
+                                                        JoinPdl>;
+    } else {
+        return q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
+                                                   kValueRows, Epilogue, TriggerPdl, JoinPdl>;
+    }
+}
+
 template <int Tokens, class Publish, bool TriggerPdl, bool JoinPdl, bool Dependent>
 void launch_q5_small_t(const Tensor& x, const Weight& value_z_weight,
                        const GdnConvEpilogue<Publish>& value_epilogue, Tensor& value, Tensor& z,
                        cudaStream_t stream) {
     constexpr int q5_threads = 4 * 32;
-    const dim3 q5_grid(kValueZRows, 1u, 1u);
+    constexpr auto kernel    = q5_small_t_kernel<Tokens, Publish, TriggerPdl, JoinPdl>();
+    const dim3 q5_grid(static_cast<unsigned>(div_up(kValueZRows, kQ5SmallTRows<Tokens>)), 1u, 1u);
     if constexpr (Dependent) {
         CUDA_CHECK(pdl::launch_dependent(
-            {q5_grid, dim3(q5_threads), 0, stream},
-            q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
-                                                kValueRows, Q5GdnSmallTEpilogue<Tokens, Publish>,
-                                                TriggerPdl, JoinPdl>,
+            {q5_grid, dim3(q5_threads), 0, stream}, kernel,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(value_z_weight.qdata),
             static_cast<const std::uint8_t*>(value_z_weight.qhigh),
@@ -235,10 +251,7 @@ void launch_q5_small_t(const Tensor& x, const Weight& value_z_weight,
                 static_cast<__nv_bfloat16*>(z.data),
             }));
     } else {
-        q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
-                                            kValueRows, Q5GdnSmallTEpilogue<Tokens, Publish>,
-                                            TriggerPdl, JoinPdl>
-            <<<q5_grid, q5_threads, 0, stream>>>(
+        kernel<<<q5_grid, q5_threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const std::uint8_t*>(value_z_weight.qdata),
                 static_cast<const std::uint8_t*>(value_z_weight.qhigh),
@@ -334,8 +347,16 @@ void launch_conv(const Tensor& x, const Weight& qk_weight, const Weight& value_z
         launch_small_t<6, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
                                           query, value, z, stream);
         break;
+    case 7:
+        launch_small_t<7, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
+                                          query, value, z, stream);
+        break;
+    case 8:
+        launch_small_t<8, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
+                                          query, value, z, stream);
+        break;
     default:
-        throw std::invalid_argument("Q4/Q5 projection-epilogue GDN conv requires T=1..3 or 5..6");
+        throw std::invalid_argument("Q4/Q5 projection-epilogue GDN conv requires T=1..3 or 5..8");
     }
     CUDA_CHECK(cudaGetLastError());
 }

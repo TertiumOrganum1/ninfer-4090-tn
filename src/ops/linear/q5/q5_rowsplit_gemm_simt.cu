@@ -58,12 +58,35 @@ void launch_split2(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
             FullSlabs);
 }
 
+template <int Rows, int Cols, int FullSlabs, int Stride>
+void launch_split2_rows(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    constexpr int kThreads = 2 * 32;
+    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], Rows)), 1u, 1u);
+    q5_rowsplit_gemm_simt_split2_rows_kernel<Q5RowSplitSimtSchedule, Rows, Cols, FullSlabs, Stride>
+        <<<grid, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1], w.padded_shape[1],
+            FullSlabs);
+}
+
+// From eight columns on, two rows per CTA share each widened activation; below that the extra
+// accumulators cost more than the saved conversions.
+template <int Cols, int FullSlabs, int Stride>
+void launch_split2_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if constexpr (Cols >= 8) {
+        launch_split2_rows<2, Cols, FullSlabs, Stride>(x, w, out, stream);
+    } else {
+        launch_split2<Cols, FullSlabs, Stride>(x, w, out, stream);
+    }
+}
+
 template <int Cols>
 void dispatch_split2_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     if (w.k == 6144) {
-        launch_split2<Cols, 6, 6144>(x, w, out, stream);
+        launch_split2_route<Cols, 6, 6144>(x, w, out, stream);
     } else if (w.k == 17408) {
-        launch_split2<Cols, 17, 17408>(x, w, out, stream);
+        launch_split2_route<Cols, 17, 17408>(x, w, out, stream);
     } else {
         throw std::invalid_argument("q5 split2 SIMT: unsupported exact K");
     }
@@ -71,9 +94,20 @@ void dispatch_split2_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStr
 
 template <int Cols>
 void launch_split4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    constexpr int kThreads = 4 * 32;
-    const dim3 grid(static_cast<unsigned>(out.ne[0]), 1u, 1u);
+    constexpr int kThreads    = 4 * 32;
     const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    if constexpr (Cols >= 8) {
+        constexpr int kRows = 2;
+        const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], kRows)), 1u, 1u);
+        q5_rowsplit_gemm_simt_split4_rows_kernel<Q5RowSplitSimtSchedule, kRows, Cols, 5, 5120>
+            <<<grid, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+                nullptr, out.ne[0], out_ld, x.ne[0], x.ne[1], w.padded_shape[1], 5);
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(out.ne[0]), 1u, 1u);
     q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, 5120>
         <<<grid, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
@@ -100,8 +134,14 @@ void dispatch_exact_cols(std::int32_t cols, Launch&& launch) {
     case 6:
         launch.template operator()<6>();
         return;
+    case 7:
+        launch.template operator()<7>();
+        return;
+    case 8:
+        launch.template operator()<8>();
+        return;
     default:
-        throw std::invalid_argument("q5 exact SIMT: column count must be in [2,6]");
+        throw std::invalid_argument("q5 exact SIMT: column count must be in [2,8]");
     }
 }
 

@@ -152,7 +152,7 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = verify_call_invariance(query_key, gate_value);
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     // AllowA8 shares the T <= 16 route with A16 and takes the INT8 jobs above

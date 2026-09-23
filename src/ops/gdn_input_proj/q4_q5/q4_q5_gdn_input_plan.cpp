@@ -156,6 +156,8 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
     case 3:
     case 5:
     case 6:
+    case 7:
+    case 8:
         return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused};
     default:
         return {Q4Q5GdnInputConvScheduleId::Materialized};

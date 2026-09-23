@@ -1,6 +1,7 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "ops/common/math.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 
 #include <cuda_bf16.h>
@@ -23,12 +24,37 @@ void launch_split2(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
         w.padded_shape[1], FullSlabs);
 }
 
+template <int Rows, int Cols, int FullSlabs, int Stride>
+void launch_split2_rows(const Tensor& x, const Weight& w, Tensor& residual_out,
+                        cudaStream_t stream) {
+    constexpr int kThreads = 2 * 32;
+    const dim3 grid(static_cast<unsigned>(div_up(residual_out.ne[0], Rows)), 1u, 1u);
+    q5_rowsplit_gemm_simt_split2_rows_kernel<Q5RowSplitSimtSchedule, Rows, Cols, FullSlabs, Stride,
+                                             true><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(residual_out.data), residual_out.ne[0], x.ne[0], x.ne[1],
+        w.padded_shape[1], FullSlabs);
+}
+
+// From eight columns on, two rows per CTA share each widened activation; below that the extra
+// accumulators cost more than the saved conversions.
+template <int Cols, int FullSlabs, int Stride>
+void launch_split2_route(const Tensor& x, const Weight& w, Tensor& residual_out,
+                         cudaStream_t stream) {
+    if constexpr (Cols >= 8) {
+        launch_split2_rows<2, Cols, FullSlabs, Stride>(x, w, residual_out, stream);
+    } else {
+        launch_split2<Cols, FullSlabs, Stride>(x, w, residual_out, stream);
+    }
+}
+
 template <int Cols>
 void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     if (w.k == 6144) {
-        launch_split2<Cols, 6, 6144>(x, w, residual_out, stream);
+        launch_split2_route<Cols, 6, 6144>(x, w, residual_out, stream);
     } else if (w.k == 17408) {
-        launch_split2<Cols, 17, 17408>(x, w, residual_out, stream);
+        launch_split2_route<Cols, 17, 17408>(x, w, residual_out, stream);
     } else {
         throw std::invalid_argument("q5 linear_add split2: unsupported exact K");
     }
