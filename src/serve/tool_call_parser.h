@@ -3,6 +3,7 @@
 #include "serve/request.h"
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,8 +16,11 @@ struct ParsedToolCallOutput {
     std::vector<ToolCall> tool_calls;
 };
 
+// With the request's tools given, argument values are typed by each tool's parameter schema;
+// without them, or for a parameter the schema does not type, a value is guessed from its text.
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length);
+                                                 std::size_t max_tool_name_length,
+                                                 std::span<const ToolDefinition> tools = {});
 
 // Incrementally publishes text that is provably outside a possible Qwen
 // <tool_call> suffix. At terminal time, a valid tool response discards the

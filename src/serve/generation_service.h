@@ -81,6 +81,8 @@ struct PreparedRequest {
     bool include_usage                     = false;
     bool tool_capable                      = false;
     std::size_t tool_name_max_length       = 64;
+    // Declared tools, kept so the parsed call's arguments are typed by their schemas.
+    std::vector<ToolDefinition> tools;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;

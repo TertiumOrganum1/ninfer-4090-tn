@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -256,8 +257,72 @@ int test_incremental_filter_fallback() {
 
 } // namespace
 
+ninfer::serve::ToolDefinition typed_tool(const std::string& name, const Json& properties) {
+    ninfer::serve::ToolDefinition tool;
+    tool.name            = name;
+    tool.parameters_json = Json{{"type", "object"}, {"properties", properties}}.dump();
+    return tool;
+}
+
+int test_declared_types_shape_values() {
+    const std::vector<ninfer::serve::ToolDefinition> tools = {typed_tool(
+        "ship", Json{{"items", Json{{"type", "array"}}},
+                     {"express", Json{{"type", "boolean"}}},
+                     {"note", Json{{"type", "string"}}},
+                     {"code", Json{{"type", "string"}}},
+                     {"limit", Json{{"anyOf", Json::array({Json{{"type", "integer"}},
+                                                           Json{{"type", "null"}}})}}},
+                     {"flag", Json{{"type", "boolean"}}}})};
+    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=ship>\n"
+        "<parameter=items>\n[{\"sku\":\"SKU-11\",\"qty\":2}]\n</parameter>\n"
+        "<parameter=express>\nTrue\n</parameter>\n"
+        "<parameter=note>\n{\"looks\":\"like json\"}\n</parameter>\n"
+        "<parameter=code>\n  indented\n</parameter>\n"
+        "<parameter=limit>\n5\n</parameter>\n"
+        "<parameter=flag>\n\n</parameter>\n"
+        "</function>\n</tool_call>",
+        64, tools);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "typed call parsed as tool response");
+    if (parsed.tool_calls.size() != 1) { return failures; }
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("items").at(0).at("qty") == 2, "array parameter parsed as JSON");
+    failures += check(args.at("express") == true, "capitalized boolean accepted");
+    failures += check(args.at("note") == "{\"looks\":\"like json\"}",
+                      "string parameter kept as text although it parses as JSON");
+    failures += check(args.at("code") == "  indented", "string keeps its own indentation");
+    failures += check(args.at("limit") == 5, "anyOf integer parsed as number");
+    failures += check(!args.contains("flag"), "empty boolean left out");
+    return failures;
+}
+
+int test_undeclared_parameters_keep_guessing() {
+    const std::vector<ninfer::serve::ToolDefinition> tools = {
+        typed_tool("ship", Json{{"note", Json{{"type", "string"}}}})};
+    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n<function=ship>\n<parameter=count>\n3\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=other>\n<parameter=note>\n7\n</parameter>\n"
+        "</function>\n</tool_call>",
+        64, tools);
+
+    int failures = 0;
+    failures += check(parsed.tool_calls.size() == 2, "two calls with partial schemas");
+    if (parsed.tool_calls.size() != 2) { return failures; }
+    failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("count") == 3,
+                      "parameter missing from the schema is guessed");
+    failures += check(Json::parse(parsed.tool_calls[1].arguments_json).at("note") == 7,
+                      "tool missing from the list is guessed");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_declared_types_shape_values();
+    failures += test_undeclared_parameters_keep_guessing();
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_hermes_json_call();

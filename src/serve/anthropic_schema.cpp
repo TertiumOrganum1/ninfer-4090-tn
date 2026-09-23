@@ -560,6 +560,19 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
         out.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
 
+    // Session routing hint, spelled the same way as on the Chat Completions and
+    // Responses surfaces. Both surfaces build this same GenerationRequest, so a
+    // client that keeps several long conversations alive on one device can name
+    // them here and have the continuation cache restore each one instead of
+    // re-prefilling it after the other evicted its lane.
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
+        if (!body.at("prompt_cache_key").is_string()) {
+            bad_request("prompt_cache_key must be a string", "prompt_cache_key");
+        }
+        std::string key = body.at("prompt_cache_key").get<std::string>();
+        if (!key.empty()) { out.prompt_cache_routing_hint = std::move(key); }
+    }
+
     out.stream = get_bool(body, "stream", false);
 
     const std::optional<int> max_tokens = get_int(body, "max_tokens");
